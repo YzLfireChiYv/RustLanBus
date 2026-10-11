@@ -1,0 +1,15 @@
+[package]
+name = "rlb-audio"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rlb-clock = { path = "../rlb-clock" }
+rlb-model = { path = "../rlb-model" }
+thiserror = "2.0.20"
+
+[lints]
+workspace = true

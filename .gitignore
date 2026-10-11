@@ -1,0 +1,9 @@
+/target/
+/private/
+/logs/
+/recordings/
+.env
+.env.*
+*.7z
+*.zip
+*.bundle

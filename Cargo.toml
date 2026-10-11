@@ -1,0 +1,37 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/rlb-model",
+    "crates/rlb-clock",
+    "crates/rlb-codec",
+    "crates/rlb-audio",
+    "crates/rlb-audio-windows",
+    "crates/rlb-peer",
+    "apps/peer-lab",
+]
+default-members = ["apps/peer-lab"]
+
+[workspace.package]
+version = "0.2.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/YzLfireChiYv/RustLanBus"
+rust-version = "1.85"
+
+[workspace.dependencies]
+rlb-model = { path = "crates/rlb-model" }
+rlb-clock = { path = "crates/rlb-clock" }
+rlb-codec = { path = "crates/rlb-codec" }
+rlb-audio = { path = "crates/rlb-audio" }
+rlb-audio-windows = { path = "crates/rlb-audio-windows" }
+rlb-peer = { path = "crates/rlb-peer" }
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = "warn"
+
+[profile.release]
+codegen-units = 1
+lto = "thin"
