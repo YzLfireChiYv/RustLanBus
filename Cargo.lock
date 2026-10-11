@@ -182,6 +182,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustlanbus-audio-lab"
+version = "0.2.0"
+dependencies = [
+ "rlb-audio",
+ "rlb-audio-windows",
+ "rlb-model",
+ "rlb-peer",
+]
+
+[[package]]
 name = "rustlanbus-peer-lab"
 version = "0.2.0"
 dependencies = [

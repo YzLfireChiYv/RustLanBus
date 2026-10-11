@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{MAX_DATAGRAM_BYTES, PeerError};
 
-pub(crate) const CONTROL_MAGIC: &[u8; 4] = b"RLC1";
+pub(crate) const CONTROL_MAGIC: &[u8; 4] = b"RLC2";
 
 /// Persisted user choices for this particular peer; playback mute is separate.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

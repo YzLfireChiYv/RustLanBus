@@ -4,12 +4,16 @@ use rlb_model::DirectSessionId;
 use crate::PeerError;
 
 pub const MAX_DATAGRAM_BYTES: usize = 1200;
-pub(crate) const MEDIA_MAGIC: &[u8; 4] = b"RLP1";
-pub(crate) const HEADER_BYTES: usize = 60;
+pub(crate) const MEDIA_MAGIC: &[u8; 4] = b"RLP2";
+pub(crate) const HEADER_BYTES: usize = 68;
 
 /// Original samples received from the configured peer. No local mixing occurs.
+/// Playback adapters reset buffered source time when `source_epoch` changes,
+/// and also when `PeerStatus::session` or `PeerStatus::remote_run` changes.
 #[derive(Clone, Debug, PartialEq)]
 pub struct OriginalAudio {
+    /// Monotonic within the sender's process run; a change resets source time.
+    pub source_epoch: u64,
     pub sample_rate: u32,
     pub channels: u8,
     pub start_frame: u64,
@@ -22,6 +26,7 @@ pub(crate) struct Header {
     pub session: DirectSessionId,
     pub send_generation: u64,
     pub receive_generation: u64,
+    pub source_epoch: u64,
     pub sequence: u64,
     pub start_frame: u64,
     pub sample_rate: u32,
@@ -44,6 +49,7 @@ pub(crate) fn encode(header: Header, samples: &[f32]) -> Result<Vec<u8>, PeerErr
     bytes[52..56].copy_from_slice(&header.sample_rate.to_le_bytes());
     bytes[56] = header.channels;
     bytes[57..59].copy_from_slice(&header.frames.to_le_bytes());
+    bytes[60..68].copy_from_slice(&header.source_epoch.to_le_bytes());
     encode_f32le_into(
         header.channels,
         usize::from(header.frames),
@@ -66,6 +72,7 @@ pub(crate) fn header(bytes: &[u8]) -> Result<Header, PeerError> {
             .map_err(|_| PeerError::InvalidAudio)?,
         send_generation: u64::from_le_bytes(bytes[20..28].try_into().unwrap()),
         receive_generation: u64::from_le_bytes(bytes[28..36].try_into().unwrap()),
+        source_epoch: u64::from_le_bytes(bytes[60..68].try_into().unwrap()),
         sequence: u64::from_le_bytes(bytes[36..44].try_into().unwrap()),
         start_frame: u64::from_le_bytes(bytes[44..52].try_into().unwrap()),
         sample_rate: u32::from_le_bytes(bytes[52..56].try_into().unwrap()),
@@ -76,6 +83,7 @@ pub(crate) fn header(bytes: &[u8]) -> Result<Header, PeerError> {
         || !(8_000..=384_000).contains(&header.sample_rate)
         || header.frames == 0
         || header.sequence == 0
+        || header.source_epoch == 0
         || bytes.len()
             != HEADER_BYTES + usize::from(header.frames) * usize::from(header.channels) * 4
         || header
@@ -107,6 +115,7 @@ pub(crate) fn decode(bytes: &[u8], header: Header) -> Result<OriginalAudio, Peer
     )
     .map_err(|_| PeerError::InvalidAudio)?;
     Ok(OriginalAudio {
+        source_epoch: header.source_epoch,
         sample_rate: header.sample_rate,
         channels: header.channels,
         start_frame: header.start_frame,

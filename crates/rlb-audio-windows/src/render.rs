@@ -1,7 +1,10 @@
 use rlb_audio::{AudioError, BackendStatus, EndpointDescriptor, EndpointDirection, RenderBackend};
 use windows::Win32::Media::Audio::{AUDCLNT_BUFFERFLAGS_SILENT, IAudioRenderClient};
 
-use crate::client::{ClientUsage, EventWait, NativeClient, SharedPeriodPreference};
+use crate::client::{
+    ClientUsage, EventWait, NativeClient, SharedEnginePeriods, SharedPeriodPreference,
+    WasapiCallFailure,
+};
 use crate::endpoint::{EndpointEnumerator, EndpointSelection, resolve_selection};
 use crate::{WasapiFormat, WindowsAudioError, hresult};
 
@@ -27,12 +30,20 @@ pub struct RenderStreamDiagnostics {
     pub buffer_frames: u32,
     /// Period asked of `IAudioClient3` before any fallback.
     pub requested_period_frames: u32,
-    /// Negotiated callback period in frames.
+    /// Requested shared callback period, or estimated classic period in frames.
     pub period_frames: u32,
-    /// Default device period in 100 ns units.
+    /// Classic default shared-mode device period in 100 ns units.
     pub default_period_hns: i64,
-    /// Minimum device period in 100 ns units.
+    /// Classic minimum exclusive-mode device period in 100 ns units.
     pub minimum_period_hns: i64,
+    /// Complete shared-engine period range for the requested stream format.
+    pub shared_engine_periods: Option<SharedEnginePeriods>,
+    /// Failure to obtain the shared-engine period range.
+    pub shared_engine_period_failure: Option<WasapiCallFailure>,
+    /// Failure from opening the requested minimum-period stream, if attempted.
+    pub minimum_period_failure: Option<WasapiCallFailure>,
+    /// Failure from opening the default-period shared stream, if attempted.
+    pub default_period_failure: Option<WasapiCallFailure>,
     /// Successful render submissions.
     pub submitted_callbacks: u64,
     /// Stereo frames written to the endpoint.
@@ -52,12 +63,18 @@ pub struct WasapiRenderStream {
 
 impl WasapiRenderStream {
     /// Opens a stereo render stream on the current MTA thread.
+    ///
+    /// The caller must keep a COM MTA initialization alive for the stream's
+    /// complete lifetime. Prefer an owned `EndpointEnumerator` on the audio
+    /// thread and its `open_render` method, with the stream dropped first.
     pub fn open(request: RenderRequest) -> Result<Self, WindowsAudioError> {
         let enumerator = EndpointEnumerator::new()?;
         enumerator.open_render(request)
     }
 
     /// Opens render using `preference` for the shared-mode period.
+    ///
+    /// The caller must retain COM MTA initialization as described in [`Self::open`].
     pub fn open_with_period(
         request: RenderRequest,
         preference: SharedPeriodPreference,
@@ -91,6 +108,10 @@ impl WasapiRenderStream {
             period_frames: self.client.period_frames,
             default_period_hns: self.client.default_period_hns,
             minimum_period_hns: self.client.minimum_period_hns,
+            shared_engine_periods: self.client.shared_engine_periods,
+            shared_engine_period_failure: self.client.shared_engine_period_failure,
+            minimum_period_failure: self.client.minimum_period_failure,
+            default_period_failure: self.client.default_period_failure,
             submitted_callbacks: self.submitted_callbacks,
             submitted_frames: self.submitted_frames,
         }
@@ -107,9 +128,9 @@ impl WasapiRenderStream {
         Ok(self.client.buffer_frames.saturating_sub(padding))
     }
 
-    /// Prefills silence when possible and starts the endpoint stream.
+    /// Prefills silence and starts the endpoint stream after prefill succeeds.
     pub fn start(&mut self) -> Result<(), WindowsAudioError> {
-        let _ = self.prefill_silence();
+        self.prefill_silence()?;
         self.client.start()?;
         self.status = BackendStatus::Running;
         Ok(())
@@ -157,13 +178,8 @@ impl EndpointEnumerator {
         let catalog = self.enumerate()?;
         let info = resolve_selection(&request.selection, EndpointDirection::Render, &catalog)?;
         let endpoint = info.to_descriptor(EndpointDirection::Render, 2)?;
-        let client = NativeClient::open(
-            self,
-            info.endpoint_id(),
-            2,
-            ClientUsage::Render,
-            preference,
-        )?;
+        let client =
+            NativeClient::open(self, info.endpoint_id(), 2, ClientUsage::Render, preference)?;
         let render = client.render_service()?;
         Ok(WasapiRenderStream {
             client,

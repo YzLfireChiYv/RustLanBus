@@ -15,6 +15,7 @@ mod fake;
 mod graph;
 mod metrics;
 mod mixer;
+mod playout;
 
 pub use backend::{
     BackendStatus, CaptureBackend, CaptureProcessBuffer, CaptureProcessResult,
@@ -37,4 +38,8 @@ pub use metrics::{AudioMetrics, AudioMetricsSnapshot};
 pub use mixer::{
     DEFAULT_LIMITER_KNEE, LIMITER_ALGORITHM_ID, RAMP_FRAMES, RenderReport, SharedRenderMixer,
     SoftLimiter, SourceReadOutcome, SourceReader, SourceRenderConfig, SourceRenderMetricsSnapshot,
+};
+pub use playout::{
+    DirectPcmPlayout, DirectPlayoutConfig, PcmPacket, PlayoutError, PlayoutPushReport,
+    PlayoutRenderReport, PlayoutStats,
 };

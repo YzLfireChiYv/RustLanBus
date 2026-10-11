@@ -6,7 +6,10 @@ use rlb_audio::{
 use rlb_model::{SAMPLE_RATE_HZ, SourceId, StreamEpoch};
 use windows::Win32::Media::Audio::IAudioCaptureClient;
 
-use crate::client::{ClientUsage, EventWait, NativeClient, SharedPeriodPreference};
+use crate::client::{
+    ClientUsage, EventWait, NativeClient, SharedEnginePeriods, SharedPeriodPreference,
+    WasapiCallFailure,
+};
 use crate::clock::{capture_instant, wasapi_clock_domain};
 use crate::convert::{copy_interleaved_f32_to_planar, write_silence};
 use crate::endpoint::{EndpointEnumerator, EndpointSelection, resolve_selection};
@@ -52,12 +55,20 @@ pub struct CaptureStreamDiagnostics {
     pub buffer_frames: u32,
     /// Period asked of `IAudioClient3` before any fallback.
     pub requested_period_frames: u32,
-    /// Negotiated callback period in frames.
+    /// Requested shared callback period, or estimated classic period in frames.
     pub period_frames: u32,
-    /// Default device period in 100 ns units.
+    /// Classic default shared-mode device period in 100 ns units.
     pub default_period_hns: i64,
-    /// Minimum device period in 100 ns units.
+    /// Classic minimum exclusive-mode device period in 100 ns units.
     pub minimum_period_hns: i64,
+    /// Complete shared-engine period range for the requested stream format.
+    pub shared_engine_periods: Option<SharedEnginePeriods>,
+    /// Failure to obtain the shared-engine period range.
+    pub shared_engine_period_failure: Option<WasapiCallFailure>,
+    /// Failure from opening the requested minimum-period stream, if attempted.
+    pub minimum_period_failure: Option<WasapiCallFailure>,
+    /// Failure from opening the default-period shared stream, if attempted.
+    pub default_period_failure: Option<WasapiCallFailure>,
     /// Packets delivered through [`WasapiCaptureStream::process`].
     pub captured_packets: u64,
     /// Packets dropped because they exceeded prepared storage.
@@ -91,6 +102,10 @@ pub struct WasapiCaptureStream {
 
 impl WasapiCaptureStream {
     /// Opens a capture stream on the current MTA thread.
+    ///
+    /// The caller must keep a COM MTA initialization alive for the stream's
+    /// complete lifetime. Prefer an owned `EndpointEnumerator` on the audio
+    /// thread and its `open_capture` method, with the stream dropped first.
     pub fn open(request: CaptureRequest) -> Result<Self, WindowsAudioError> {
         let enumerator = EndpointEnumerator::new()?;
         enumerator.open_capture(request)
@@ -127,6 +142,10 @@ impl WasapiCaptureStream {
             period_frames: self.client.period_frames,
             default_period_hns: self.client.default_period_hns,
             minimum_period_hns: self.client.minimum_period_hns,
+            shared_engine_periods: self.client.shared_engine_periods,
+            shared_engine_period_failure: self.client.shared_engine_period_failure,
+            minimum_period_failure: self.client.minimum_period_failure,
+            default_period_failure: self.client.default_period_failure,
             captured_packets: self.captured_packets,
             capacity_violations: self.capacity_violations,
             discontinuities: self.discontinuities,

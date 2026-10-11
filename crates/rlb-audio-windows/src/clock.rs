@@ -16,7 +16,13 @@ pub fn wasapi_clock_domain() -> CaptureClockDomain {
     )
 }
 
-pub(crate) fn qpc_100ns_now() -> Option<u64> {
+/// Returns the current local QPC time scaled to WASAPI's 100 ns tick domain.
+///
+/// Compare this only with capture timestamps whose clock domain is
+/// [`wasapi_clock_domain`]. These absolute ticks have a different origin and
+/// scale from Rust `Instant` elapsed durations and from clocks on other hosts.
+#[must_use]
+pub fn wasapi_qpc_100ns_now() -> Option<u64> {
     let mut counter = 0_i64;
     let mut frequency = 0_i64;
     unsafe { QueryPerformanceCounter(&mut counter) }.ok()?;
@@ -29,7 +35,7 @@ pub(crate) fn qpc_100ns_now() -> Option<u64> {
 }
 
 pub(crate) fn capture_instant(qpc_100ns: Option<u64>) -> MonotonicInstant {
-    let ticks = qpc_100ns.or_else(qpc_100ns_now).unwrap_or(0);
+    let ticks = qpc_100ns.or_else(wasapi_qpc_100ns_now).unwrap_or(0);
     MonotonicInstant::from_ticks(ticks)
 }
 
@@ -43,8 +49,8 @@ mod tests {
             wasapi_clock_domain().ticks_per_second().get(),
             WASAPI_QPC_TICKS_PER_SECOND
         );
-        let first = qpc_100ns_now().expect("qpc");
-        let second = qpc_100ns_now().expect("qpc");
+        let first = wasapi_qpc_100ns_now().expect("qpc");
+        let second = wasapi_qpc_100ns_now().expect("qpc");
         assert!(second >= first);
     }
 }

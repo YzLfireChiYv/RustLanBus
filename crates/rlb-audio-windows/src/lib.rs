@@ -18,8 +18,8 @@ mod supervisor;
 mod worker;
 
 pub use capture::{CaptureFlow, CaptureRequest, CaptureStreamDiagnostics, WasapiCaptureStream};
-pub use client::{EventWait, SharedPeriodPreference};
-pub use clock::{WASAPI_QPC_TICKS_PER_SECOND, wasapi_clock_domain};
+pub use client::{EventWait, SharedEnginePeriods, SharedPeriodPreference, WasapiCallFailure};
+pub use clock::{WASAPI_QPC_TICKS_PER_SECOND, wasapi_clock_domain, wasapi_qpc_100ns_now};
 pub use endpoint::{
     BindingAction, EndpointCatalog, EndpointEnumerator, EndpointInfo, EndpointRole,
     EndpointSelection, poll_binding, resolve_selection,

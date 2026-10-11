@@ -1,0 +1,16 @@
+[package]
+name = "rustlanbus-audio-lab"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[target.'cfg(windows)'.dependencies]
+rlb-model.workspace = true
+rlb-audio.workspace = true
+rlb-audio-windows.workspace = true
+rlb-peer.workspace = true
+
+[lints]
+workspace = true

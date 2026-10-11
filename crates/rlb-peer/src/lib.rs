@@ -5,8 +5,8 @@
 //! The socket owner supplies monotonically increasing milliseconds and routes
 //! datagrams only from the configured peer endpoint. Each instance owns one
 //! directed-permission pair. Received audio has no automatic publication path.
-//! Phase 1 permits one local PCM format and forward-only source timeline per
-//! process run; device/source epoch switching belongs to a subsequent slice.
+//! Each source epoch permits one local PCM format and a forward-only frame
+//! timeline. Explicit source resets preserve the peer session and permissions.
 
 mod media;
 mod peer;

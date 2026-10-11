@@ -8,6 +8,7 @@ members = [
     "crates/rlb-audio-windows",
     "crates/rlb-peer",
     "apps/peer-lab",
+    "apps/audio-lab",
 ]
 default-members = ["apps/peer-lab"]
 

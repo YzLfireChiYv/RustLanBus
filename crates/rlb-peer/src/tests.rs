@@ -145,6 +145,7 @@ fn pcm_is_bit_exact_mtu_bounded_and_accepts_reordering_without_duplicates() {
         .collect();
     let packets = a.encode_original(48_000, 2, 15, &samples).unwrap();
     assert!(packets.len() > 1);
+    assert_eq!(crate::media::header(&packets[0]).unwrap().frames, 141);
     assert!(
         packets
             .iter()
@@ -181,6 +182,110 @@ fn pcm_is_bit_exact_mtu_bounded_and_accepts_reordering_without_duplicates() {
         a.encode_original(48_000, 2, 514, &[0.0, 0.0]),
         Err(PeerError::SourceTimelineWentBackwards)
     );
+}
+
+#[test]
+fn source_reset_changes_format_and_timeline_preserving_reverse_and_rejecting_late_audio() {
+    let (mut a, mut b) = pair(intent(true, true), intent(true, true));
+    pump(&mut a, &mut b, 0);
+    let a_status = a.status();
+    let b_status = b.status();
+    let first = a
+        .encode_original(48_000, 2, 100, &[0.25, -0.25])
+        .unwrap()
+        .remove(0);
+    assert_eq!(b.ingest(&first, 1).unwrap().unwrap().source_epoch, 1);
+    let late_old = a
+        .encode_original(48_000, 2, 101, &[0.5, -0.5])
+        .unwrap()
+        .remove(0);
+
+    assert_eq!(a.reset_source().unwrap(), 2);
+    assert_eq!(a.status(), a_status);
+    assert_eq!(b.status(), b_status);
+    let samples = [-0.0, f32::from_bits(1), f32::MAX];
+    let current = a.encode_original(44_100, 1, 0, &samples).unwrap().remove(0);
+    let received = b.ingest(&current, 2).unwrap().unwrap();
+    assert_eq!(received.source_epoch, 2);
+    assert_eq!(
+        (
+            received.sample_rate,
+            received.channels,
+            received.start_frame
+        ),
+        (44_100, 1, 0)
+    );
+    assert_eq!(
+        received
+            .samples
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect::<Vec<_>>(),
+        samples
+            .iter()
+            .map(|sample| sample.to_bits())
+            .collect::<Vec<_>>()
+    );
+    assert!(b.ingest(&late_old, 2).unwrap().is_none());
+    let reverse = b.encode_original(48_000, 1, 50, &[0.75]).unwrap().remove(0);
+    assert_eq!(a.ingest(&reverse, 2).unwrap().unwrap().source_epoch, 1);
+    assert_eq!(a.status(), a_status);
+
+    // A malformed higher epoch cannot retire the most recent valid source.
+    let next = a.encode_original(44_100, 1, 3, &[0.125]).unwrap().remove(0);
+    let mut corrupt_future = next.clone();
+    corrupt_future[60..68].copy_from_slice(&3_u64.to_le_bytes());
+    corrupt_future[68..72].copy_from_slice(&f32::NAN.to_le_bytes());
+    assert_eq!(
+        b.ingest(&corrupt_future, 3),
+        Err(PeerError::NonFiniteSample)
+    );
+    assert_eq!(b.ingest(&next, 3).unwrap().unwrap().source_epoch, 2);
+
+    // A restart of the same format also permits frame zero in a fresh epoch.
+    assert_eq!(a.reset_source().unwrap(), 3);
+    let restarted = a.encode_original(44_100, 1, 0, &[0.5]).unwrap().remove(0);
+    assert_eq!(b.ingest(&restarted, 3).unwrap().unwrap().source_epoch, 3);
+    assert!(b.ingest(&current, 3).unwrap().is_none());
+}
+
+#[test]
+fn receive_source_high_water_survives_regrant_and_recontact_until_remote_run_changes() {
+    let (mut a, mut b) = pair(intent(true, true), intent(true, true));
+    pump(&mut a, &mut b, 0);
+    a.reset_source().unwrap();
+    a.reset_source().unwrap();
+    let first = a.encode_original(48_000, 1, 0, &[0.25]).unwrap().remove(0);
+    assert_eq!(b.ingest(&first, 0).unwrap().unwrap().source_epoch, 3);
+    b.set_intent(intent(true, false), 1).unwrap();
+    pump(&mut a, &mut b, 1);
+    b.set_intent(intent(true, true), 2).unwrap();
+    pump(&mut a, &mut b, 2);
+    let granted = a.encode_original(48_000, 1, 1, &[0.5]).unwrap().remove(0);
+    let mut lower_epoch = granted.clone();
+    lower_epoch[60..68].copy_from_slice(&2_u64.to_le_bytes());
+    assert!(b.ingest(&lower_epoch, 2).unwrap().is_none());
+    assert_eq!(b.ingest(&granted, 2).unwrap().unwrap().source_epoch, 3);
+
+    let session = a.status().session;
+    a.reconnect(3).unwrap();
+    pump(&mut a, &mut b, 3);
+    assert_ne!(a.status().session, session);
+    let recontacted = a.encode_original(48_000, 1, 2, &[0.75]).unwrap().remove(0);
+    let mut lower_epoch = recontacted.clone();
+    lower_epoch[60..68].copy_from_slice(&1_u64.to_le_bytes());
+    assert!(b.ingest(&lower_epoch, 3).unwrap().is_none());
+    assert_eq!(b.ingest(&recontacted, 3).unwrap().unwrap().source_epoch, 3);
+    let reverse = b.encode_original(48_000, 1, 0, &[0.125]).unwrap().remove(0);
+    assert_eq!(a.ingest(&reverse, 3).unwrap().unwrap().samples, vec![0.125]);
+
+    a = Peer::new(member(1), member(2), run(6), intent(true, true), 4).unwrap();
+    pump(&mut a, &mut b, 4);
+    assert_eq!(b.status().remote_run, Some(run(6)));
+    let replacement = a.encode_original(44_100, 1, 0, &[-0.0]).unwrap().remove(0);
+    let audio = b.ingest(&replacement, 4).unwrap().unwrap();
+    assert_eq!(audio.source_epoch, 1);
+    assert_eq!(audio.samples[0].to_bits(), (-0.0_f32).to_bits());
 }
 
 #[test]

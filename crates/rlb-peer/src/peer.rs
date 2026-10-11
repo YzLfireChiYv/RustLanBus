@@ -44,7 +44,7 @@ impl fmt::Display for PeerError {
             Self::InvalidAudio => "invalid mono/stereo F32 audio or frame count",
             Self::NonFiniteSample => "non-finite audio samples are rejected",
             Self::NotSending => "directed sending permission has not been confirmed",
-            Self::SourceFormatChanged => "phase 1 requires one local PCM format per process run",
+            Self::SourceFormatChanged => "a source format change requires a fresh source epoch",
             Self::SourceTimelineWentBackwards => {
                 "local source frame positions must progress forward"
             }
@@ -94,7 +94,13 @@ struct Session {
     sent_ms: u64,
     next_sequence: u64,
     seen: Seen,
-    remote_format: Option<(u32, u8)>,
+}
+
+#[derive(Clone, Copy)]
+struct RemoteSource {
+    run: RunId,
+    epoch: u64,
+    format: (u32, u8),
 }
 
 /// One peer pair. All waits, sockets, saved JSON, devices and playback live in
@@ -111,8 +117,10 @@ pub struct Peer {
     outgoing: VecDeque<Vec<u8>>,
     now_ms: u64,
     hello_ms: u64,
+    local_source_epoch: u64,
     local_format: Option<(u32, u8)>,
     local_end_frame: Option<u64>,
+    remote_source: Option<RemoteSource>,
 }
 
 impl Peer {
@@ -137,8 +145,10 @@ impl Peer {
             outgoing: VecDeque::with_capacity(MAX_CONTROL_QUEUE),
             now_ms,
             hello_ms: now_ms,
+            local_source_epoch: 1,
             local_format: None,
             local_end_frame: None,
+            remote_source: None,
         };
         peer.queue_hello()?;
         Ok(peer)
@@ -288,6 +298,22 @@ impl Peer {
         self.outgoing.pop_front()
     }
 
+    /// Begin a fresh local capture timeline after a device/source restart or
+    /// format change. Call before encoding the new source's first frame. The
+    /// process-run epoch advances even while disconnected; session and both
+    /// directed permissions remain usable. Receivers adopt it on the first
+    /// accepted packet and reject late packets from preceding source epochs.
+    pub fn reset_source(&mut self) -> Result<u64, PeerError> {
+        let epoch = self
+            .local_source_epoch
+            .checked_add(1)
+            .ok_or(PeerError::CounterExhausted)?;
+        self.local_source_epoch = epoch;
+        self.local_format = None;
+        self.local_end_frame = None;
+        Ok(epoch)
+    }
+
     /// Only bytes from this peer's configured UDP endpoint should reach here.
     /// Valid stale sessions/control are ignored. Malformed datagrams return an
     /// error. Accepted audio has no internal queue or local publication path.
@@ -366,6 +392,7 @@ impl Peer {
                 session: active.id,
                 send_generation: self.local.send_generation,
                 receive_generation: active.remote.receive_generation,
+                source_epoch: self.local_source_epoch,
                 sequence: active.next_sequence,
                 start_frame: start_frame + (index * max_frames) as u64,
                 sample_rate,
@@ -476,6 +503,14 @@ impl Peer {
         ack: Ack,
         ready_nonce: Option<BindNonce>,
     ) {
+        // A recontact in the same process run preserves the source high-water
+        // mark. Only an actually activated replacement run can restart epochs.
+        if self
+            .remote_source
+            .is_some_and(|source| source.run != pending.remote_run)
+        {
+            self.remote_source = None;
+        }
         self.active = Some(Session {
             id: pending.session,
             remote_run: pending.remote_run,
@@ -487,7 +522,6 @@ impl Peer {
             sent_ms: self.now_ms,
             next_sequence: 1,
             seen: Seen::default(),
-            remote_format: None,
         });
         self.pending = None;
     }
@@ -677,20 +711,27 @@ impl Peer {
             || !active.remote.intent.send
             || header.send_generation != active.remote.send_generation
             || header.receive_generation != self.local.receive_generation
+            || self
+                .remote_source
+                .is_some_and(|source| header.source_epoch < source.epoch)
         {
             return Ok(None);
         }
-        if active
-            .remote_format
-            .is_some_and(|format| format != (header.sample_rate, header.channels))
-        {
+        if self.remote_source.is_some_and(|source| {
+            header.source_epoch == source.epoch
+                && source.format != (header.sample_rate, header.channels)
+        }) {
             return Err(PeerError::SourceFormatChanged);
         }
         let audio = media::decode(bytes, header)?;
         if !active.seen.insert(header.sequence) {
             return Ok(None);
         }
-        active.remote_format = Some((header.sample_rate, header.channels));
+        self.remote_source = Some(RemoteSource {
+            run: active.remote_run,
+            epoch: header.source_epoch,
+            format: (header.sample_rate, header.channels),
+        });
         active.last_seen_ms = self.now_ms;
         Ok(Some(audio))
     }
