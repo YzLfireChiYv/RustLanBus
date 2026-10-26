@@ -1,0 +1,25 @@
+[package]
+name = "rlb-contact"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+mdns-sd = { version = "=0.21.6", default-features = false, optional = true }
+socket2 = "=0.6.5"
+rlb-control.workspace = true
+rlb-model.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2.0.20"
+
+[features]
+mdns = ["dep:mdns-sd"]
+
+[dev-dependencies]
+rlb-model.workspace = true
+
+[lints]
+workspace = true

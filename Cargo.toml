@@ -4,28 +4,52 @@ members = [
     "crates/rlb-model",
     "crates/rlb-clock",
     "crates/rlb-codec",
+    "crates/rlb-jitter",
+    "crates/rlb-net",
+    "crates/rlb-media",
     "crates/rlb-audio",
     "crates/rlb-audio-windows",
+    "crates/rlb-control",
+    "crates/rlb-registry",
+    "crates/rlb-session",
+    "crates/rlb-sim",
     "crates/rlb-peer",
+    "crates/rlb-contact",
+    "crates/rlb-return",
+    "apps/engine",
+    "apps/desktop/src-tauri",
+    "services/registryd",
+    "services/contactd",
+    "tools/udp-echo",
+    "apps/short-path",
     "apps/peer-lab",
     "apps/audio-lab",
 ]
-default-members = ["apps/peer-lab"]
+default-members = ["apps/engine", "services/registryd"]
 
 [workspace.package]
 version = "0.2.0"
 edition = "2024"
 license = "GPL-3.0-only"
 repository = "https://github.com/YzLfireChiYv/RustLanBus"
-rust-version = "1.85"
+rust-version = "1.87"
 
 [workspace.dependencies]
 rlb-model = { path = "crates/rlb-model" }
 rlb-clock = { path = "crates/rlb-clock" }
 rlb-codec = { path = "crates/rlb-codec" }
+rlb-jitter = { path = "crates/rlb-jitter" }
+rlb-net = { path = "crates/rlb-net" }
+rlb-media = { path = "crates/rlb-media" }
 rlb-audio = { path = "crates/rlb-audio" }
 rlb-audio-windows = { path = "crates/rlb-audio-windows" }
+rlb-control = { path = "crates/rlb-control" }
+rlb-registry = { path = "crates/rlb-registry" }
+rlb-session = { path = "crates/rlb-session" }
+rlb-sim = { path = "crates/rlb-sim" }
 rlb-peer = { path = "crates/rlb-peer" }
+rlb-contact = { path = "crates/rlb-contact" }
+rlb-return = { path = "crates/rlb-return" }
 
 [workspace.lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

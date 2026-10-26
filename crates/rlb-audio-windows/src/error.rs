@@ -46,6 +46,36 @@ pub enum WindowsAudioError {
     /// The active endpoint cannot accept the fixed 48 kHz f32 engine stream.
     #[error("endpoint does not support the requested 48 kHz f32 shared stream")]
     UnsupportedEngineFormat,
+    /// The endpoint mix format cannot be opened through the native PCM entry.
+    #[error("native PCM mix format was rejected: {reason}")]
+    NativeFormatRejected {
+        /// Why this mix format stayed closed.
+        reason: crate::format::NativeFormatReject,
+    },
+    /// A fixed 48 kHz stream method was called on a native-format stream.
+    #[error("fixed 48 kHz stream method was called on a native PCM stream")]
+    NativeStreamLegacyCall,
+    /// A native-format stream method was called on a fixed 48 kHz stream.
+    #[error("native PCM stream method was called on a fixed 48 kHz stream")]
+    LegacyStreamNativeCall,
+    /// A native packet contained non-finite samples. Those samples were not copied.
+    #[error(
+        "native packet at frame {start_sample} ({frames} frames) contained {non_finite_samples} non-finite samples"
+    )]
+    NativeSamplesNonFinite {
+        /// Frames in the refused packet.
+        frames: u32,
+        /// Non-finite samples found in that packet.
+        non_finite_samples: u64,
+        /// Source or output frame where the refused packet started.
+        start_sample: u64,
+    },
+    /// The capture client returned a packet whose storage could not be read.
+    #[error("native capture packet of {frames} frames was malformed")]
+    MalformedNativePacket {
+        /// Frames reported for the malformed packet.
+        frames: u32,
+    },
     /// A packet discontinuity could not be converted to a known source-frame gap.
     #[error("capture discontinuity has no reliable frame duration; start a new epoch")]
     UnknownDiscontinuity,
@@ -94,6 +124,10 @@ impl WindowsAudioError {
             Self::DeviceUnavailable { .. } | Self::NoDefaultEndpoint { .. } => "device_unavailable",
             Self::DirectionMismatch { .. } => "device_direction_mismatch",
             Self::UnsupportedEngineFormat => "device_format_unsupported",
+            Self::NativeFormatRejected { .. } => "native_format_rejected",
+            Self::NativeStreamLegacyCall | Self::LegacyStreamNativeCall => "native_api_mismatch",
+            Self::NativeSamplesNonFinite { .. } => "native_samples_non_finite",
+            Self::MalformedNativePacket { .. } => "native_packet_malformed",
             Self::UnknownDiscontinuity => "capture_discontinuity_unknown",
             Self::CaptureCapacityExceeded => "capture_capacity_violation",
             Self::WrongThread => "wasapi_thread_violation",
@@ -111,6 +145,10 @@ impl WindowsAudioError {
         match self {
             Self::UnknownDiscontinuity => AudioError::UnknownDiscontinuity,
             Self::CaptureCapacityExceeded => AudioError::CaptureCapacityExceeded,
+            Self::NativeStreamLegacyCall
+            | Self::LegacyStreamNativeCall
+            | Self::NativeSamplesNonFinite { .. }
+            | Self::MalformedNativePacket { .. } => AudioError::BackendContractViolation,
             Self::Core(error) => *error,
             _ => AudioError::BackendUnavailable,
         }

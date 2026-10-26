@@ -9,14 +9,18 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use rlb_model::{MemberId, RunId};
-use rlb_peer::{Intent, MAX_DATAGRAM_BYTES, OriginalAudio, Peer, PeerStatus};
+use rlb_model::{MemberId, RunId, SourceId, StreamEpoch};
+use rlb_peer::{
+    AdmittedOriginal, ChannelLayout, Intent, MAX_DATAGRAM_BYTES, PcmEncoding, PcmFormat, Peer,
+    PeerStatus, SourceKind, SourcePublisher,
+};
 use serde::{Deserialize, Serialize};
 
 type Result<T> = std::result::Result<T, Box<dyn Error>>;
 const RATE: u32 = 48_000;
-const CHANNELS: u8 = 2;
-const FRAMES: usize = 128;
+const SYSTEM_CHANNELS: u16 = 2;
+const MICROPHONE_CHANNELS: u16 = 1;
+const FRAMES: u64 = 128;
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,7 +46,8 @@ impl Config {
 struct Counts {
     controls_sent: u64,
     media_datagrams_sent: u64,
-    received_frames: u64,
+    system_frames: u64,
+    microphone_frames: u64,
     verified_samples: u64,
     mismatched_samples: u64,
     rejected_datagrams: u64,
@@ -119,11 +124,14 @@ fn run_peer(args: &[String]) -> Result<()> {
     };
     let socket = UdpSocket::bind(config.bind)?;
     socket.set_nonblocking(true)?;
+    let run_id = RunId::generate()?;
+    let mut sources = open_sources(run_id)?;
     let mut peer = Peer::new(
         config.member_id,
         config.peer_id,
-        RunId::generate()?,
+        run_id,
         config.intent(),
+        sources.publisher.catalogue(),
         0,
     )?;
     let (commands, input) = mpsc::sync_channel::<String>(16);
@@ -148,7 +156,8 @@ fn run_peer(args: &[String]) -> Result<()> {
     let origin = Instant::now();
     let mut counts = Counts::default();
     let mut last_report = Instant::now();
-    let mut last_fixture_frame = None;
+    let mut system_cursor = 0_u64;
+    let mut microphone_cursor = 0_u64;
     loop {
         let now = millis(origin);
         if seconds.is_some_and(|limit| origin.elapsed() >= Duration::from_secs(limit)) {
@@ -189,14 +198,45 @@ fn run_peer(args: &[String]) -> Result<()> {
                 _ => println!("unknown command"),
             }
         }
-        pump(&socket, config.peer, &mut peer, now, fixture, &mut counts)?;
+        pump(
+            &socket,
+            config.peer,
+            &mut peer,
+            sources.system,
+            sources.microphone,
+            now,
+            fixture,
+            &mut counts,
+        )?;
         if fixture && peer.status().send_ready {
-            // Resume at current source time. Never generate a backlog of old blocks.
-            let start = (now * u64::from(RATE) / 1000 / FRAMES as u64) * FRAMES as u64;
-            if last_fixture_frame != Some(start) {
-                send_fixture(&socket, config.peer, &mut peer, start, &mut counts)?;
-                last_fixture_frame = Some(start);
-            }
+            send_source(
+                &socket,
+                config.peer,
+                &mut sources.publisher,
+                &peer,
+                sources.system,
+                sources.system_acquisition,
+                system_cursor,
+                SYSTEM_CHANNELS,
+                FRAMES,
+                now,
+                &mut counts,
+            )?;
+            send_source(
+                &socket,
+                config.peer,
+                &mut sources.publisher,
+                &peer,
+                sources.microphone,
+                sources.microphone_acquisition,
+                microphone_cursor,
+                MICROPHONE_CHANNELS,
+                FRAMES,
+                now,
+                &mut counts,
+            )?;
+            system_cursor += FRAMES;
+            microphone_cursor += FRAMES;
         }
         if last_report.elapsed() >= Duration::from_secs(1) {
             print_summary(&peer.status(), &counts);
@@ -213,10 +253,64 @@ fn millis(origin: Instant) -> u64 {
     u64::try_from(origin.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+fn open_sources(run_id: RunId) -> Result<Sources> {
+    let system = SourceId::from_bytes([3; 16])?;
+    let microphone = SourceId::from_bytes([4; 16])?;
+    let system_acquisition = StreamEpoch::from_bytes([7; 16])?;
+    let microphone_acquisition = StreamEpoch::from_bytes([8; 16])?;
+    let mut publisher = SourcePublisher::new(run_id);
+    publisher.register(system, SourceKind::System, true)?;
+    publisher.register(microphone, SourceKind::Microphone, true)?;
+    bind(&mut publisher, system, system_acquisition, stereo())?;
+    bind(&mut publisher, microphone, microphone_acquisition, mono())?;
+    Ok(Sources {
+        publisher,
+        system,
+        microphone,
+        system_acquisition,
+        microphone_acquisition,
+    })
+}
+
+struct Sources {
+    publisher: SourcePublisher,
+    system: SourceId,
+    microphone: SourceId,
+    system_acquisition: StreamEpoch,
+    microphone_acquisition: StreamEpoch,
+}
+
+fn stereo() -> PcmFormat {
+    PcmFormat::new(RATE, ChannelLayout::StereoLeftRight, PcmEncoding::F32Le, 32)
+        .expect("stereo F32 is a supported descriptor")
+}
+
+fn mono() -> PcmFormat {
+    PcmFormat::new(RATE, ChannelLayout::Mono, PcmEncoding::F32Le, 32)
+        .expect("mono F32 is a supported descriptor")
+}
+
+fn bind(
+    publisher: &mut SourcePublisher,
+    source: SourceId,
+    acquisition: StreamEpoch,
+    format: PcmFormat,
+) -> Result<()> {
+    let request = publisher
+        .begin_binding(source, acquisition, format)?
+        .pending
+        .ok_or("synthetic binding was not reserved")?;
+    publisher.commit_binding(request, acquisition, 0)?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pump(
     socket: &UdpSocket,
     endpoint: SocketAddr,
     peer: &mut Peer,
+    system: SourceId,
+    microphone: SourceId,
     now: u64,
     verify: bool,
     counts: &mut Counts,
@@ -226,8 +320,8 @@ fn pump(
     for _ in 0..64 {
         match socket.recv_from(&mut bytes) {
             Ok((length, source)) if source == endpoint => {
-                match peer.ingest(&bytes[..length], now) {
-                    Ok(Some(audio)) => receive_audio(&audio, verify, counts),
+                match peer.ingest(&bytes[..length], now, now) {
+                    Ok(Some(audio)) => receive_audio(&audio, system, microphone, verify, counts),
                     Ok(None) => {}
                     Err(_) => counts.rejected_datagrams += 1,
                 }
@@ -302,35 +396,57 @@ fn pattern(frame: u64, channel: u8) -> f32 {
     }
 }
 
-fn send_fixture(
+#[allow(clippy::too_many_arguments)]
+fn send_source(
     socket: &UdpSocket,
     endpoint: SocketAddr,
-    peer: &mut Peer,
+    publisher: &mut SourcePublisher,
+    peer: &Peer,
+    source: SourceId,
+    acquisition: StreamEpoch,
     start: u64,
+    channels: u16,
+    frames: u64,
+    now: u64,
     counts: &mut Counts,
 ) -> Result<()> {
-    let mut samples = Vec::with_capacity(FRAMES * usize::from(CHANNELS));
-    for frame in start..start + FRAMES as u64 {
-        for channel in 0..CHANNELS {
-            samples.push(pattern(frame, channel));
+    let mut samples = Vec::with_capacity(frames as usize * usize::from(channels));
+    for frame in start..start + frames {
+        for channel in 0..channels {
+            samples.push(f64::from(pattern(frame, u8::try_from(channel).unwrap_or(0))));
         }
     }
-    for bytes in peer.encode_original(RATE, CHANNELS, start, &samples)? {
-        if transmit(socket, endpoint, &bytes, counts)? {
-            counts.media_datagrams_sent += 1;
+    let original = publisher.local_original(source, acquisition, start, &samples, now)?;
+    let prepared = publisher.prepare_pcm(original)?;
+    for packet in prepared.as_slice() {
+        if let Some(bytes) = peer.write_original(packet)? {
+            if transmit(socket, endpoint, &bytes, counts)? {
+                counts.media_datagrams_sent += 1;
+            }
         }
     }
     Ok(())
 }
 
-fn receive_audio(audio: &OriginalAudio, verify: bool, counts: &mut Counts) {
-    counts.received_frames += (audio.samples.len() / usize::from(audio.channels)) as u64;
+fn receive_audio(
+    audio: &AdmittedOriginal,
+    system: SourceId,
+    microphone: SourceId,
+    verify: bool,
+    counts: &mut Counts,
+) {
+    if audio.source_id == system {
+        counts.system_frames += u64::from(audio.frames);
+    } else if audio.source_id == microphone {
+        counts.microphone_frames += u64::from(audio.frames);
+    }
     if verify {
         for (index, sample) in audio.samples.iter().enumerate() {
-            let frame = audio.start_frame + (index / usize::from(audio.channels)) as u64;
-            let channel = (index % usize::from(audio.channels)) as u8;
+            let channels = usize::from(audio.channels());
+            let frame = audio.start_frame + (index / channels) as u64;
+            let channel = (index % channels) as u8;
             counts.verified_samples += 1;
-            if sample.to_bits() != pattern(frame, channel).to_bits() {
+            if sample.to_bits() != f64::from(pattern(frame, channel)).to_bits() {
                 counts.mismatched_samples += 1;
             }
         }
@@ -339,7 +455,7 @@ fn receive_audio(audio: &OriginalAudio, verify: bool, counts: &mut Counts) {
 
 fn print_summary(status: &PeerStatus, counts: &Counts) {
     println!(
-        "contact={} send_ready={} receive_ready={} intent={}/{} controls={} sent={} received_frames={} verified_samples={} mismatches={} rejected={} unexpected={} send_failures={} receive_failures={}",
+        "contact={} send_ready={} receive_ready={} intent={}/{} controls={} sent={} system_frames={} microphone_frames={} verified_samples={} mismatches={} rejected={} unexpected={} send_failures={} receive_failures={}",
         status.connected,
         status.send_ready,
         status.receive_ready,
@@ -347,7 +463,8 @@ fn print_summary(status: &PeerStatus, counts: &Counts) {
         status.local.receive,
         counts.controls_sent,
         counts.media_datagrams_sent,
-        counts.received_frames,
+        counts.system_frames,
+        counts.microphone_frames,
         counts.verified_samples,
         counts.mismatched_samples,
         counts.rejected_datagrams,
@@ -360,6 +477,10 @@ fn print_summary(status: &PeerStatus, counts: &Counts) {
 fn demo() -> Result<()> {
     let first = MemberId::from_bytes([1; 16])?;
     let second = MemberId::from_bytes([2; 16])?;
+    let a_run = RunId::generate()?;
+    let b_run = RunId::generate()?;
+    let mut a_sources = open_sources(a_run)?;
+    let mut b_sources = open_sources(b_run)?;
     let a_socket = UdpSocket::bind("127.0.0.1:0")?;
     let b_reservation = UdpSocket::bind("127.0.0.1:0")?;
     a_socket.set_nonblocking(true)?;
@@ -370,11 +491,12 @@ fn demo() -> Result<()> {
     let mut a = Peer::new(
         first,
         second,
-        RunId::generate()?,
+        a_run,
         Intent {
             send: true,
             receive: true,
         },
+        a_sources.publisher.catalogue(),
         0,
     )?;
     let mut a_counts = Counts::default();
@@ -384,6 +506,8 @@ fn demo() -> Result<()> {
             &a_socket,
             b_addr,
             &mut a,
+            b_sources.system,
+            b_sources.microphone,
             millis(origin),
             true,
             &mut a_counts,
@@ -395,11 +519,12 @@ fn demo() -> Result<()> {
     let mut b = Peer::new(
         second,
         first,
-        RunId::generate()?,
+        b_run,
         Intent {
             send: true,
             receive: true,
         },
+        b_sources.publisher.catalogue(),
         millis(origin),
     )?;
     let mut b_counts = Counts::default();
@@ -407,30 +532,55 @@ fn demo() -> Result<()> {
         &a_socket,
         b_addr,
         &mut a,
+        &a_sources,
         &mut a_counts,
         &b_socket,
         a_addr,
         &mut b,
+        &b_sources,
         &mut b_counts,
         origin,
         |a, b| a.send_ready && a.receive_ready && b.send_ready && b.receive_ready,
     )?;
-    let mut frame = 0;
-    send_fixture(&a_socket, b_addr, &mut a, frame, &mut a_counts)?;
-    send_fixture(&b_socket, a_addr, &mut b, frame, &mut b_counts)?;
+    send_both(
+        &a_socket,
+        b_addr,
+        &mut a_sources,
+        &a,
+        0,
+        480,
+        millis(origin),
+        &mut a_counts,
+    )?;
+    send_both(
+        &b_socket,
+        a_addr,
+        &mut b_sources,
+        &b,
+        0,
+        480,
+        millis(origin),
+        &mut b_counts,
+    )?;
     pump_pair(
         &a_socket,
         b_addr,
         &mut a,
+        &a_sources,
         &mut a_counts,
         &b_socket,
         a_addr,
         &mut b,
+        &b_sources,
         &mut b_counts,
         origin,
     )?;
-    if a_counts.received_frames == 0 || b_counts.received_frames == 0 {
-        return Err("demo: bidirectional PCM did not arrive".into());
+    if a_counts.system_frames != 480
+        || a_counts.microphone_frames != 480
+        || b_counts.system_frames != 480
+        || b_counts.microphone_frames != 480
+    {
+        return Err("demo: both sources did not deliver 480 frames in each direction".into());
     }
     b.set_intent(
         Intent {
@@ -443,30 +593,43 @@ fn demo() -> Result<()> {
         &a_socket,
         b_addr,
         &mut a,
+        &a_sources,
         &mut a_counts,
         &b_socket,
         a_addr,
         &mut b,
+        &b_sources,
         &mut b_counts,
         origin,
         |a, b| !a.send_ready && !b.receive_ready && b.send_ready && a.receive_ready,
     )?;
-    frame += FRAMES as u64;
-    let received_before = a_counts.received_frames;
-    send_fixture(&b_socket, a_addr, &mut b, frame, &mut b_counts)?;
+    let system_before = a_counts.system_frames;
+    let microphone_before = a_counts.microphone_frames;
+    send_both(
+        &b_socket,
+        a_addr,
+        &mut b_sources,
+        &b,
+        480,
+        128,
+        millis(origin),
+        &mut b_counts,
+    )?;
     pump_pair(
         &a_socket,
         b_addr,
         &mut a,
+        &a_sources,
         &mut a_counts,
         &b_socket,
         a_addr,
         &mut b,
+        &b_sources,
         &mut b_counts,
         origin,
     )?;
-    if a_counts.received_frames <= received_before {
-        return Err("demo: receive refusal stopped the healthy reverse direction".into());
+    if a_counts.system_frames <= system_before || a_counts.microphone_frames <= microphone_before {
+        return Err("demo: receive refusal stopped the healthy reverse sources".into());
     }
     b.set_intent(
         Intent {
@@ -479,57 +642,89 @@ fn demo() -> Result<()> {
         &a_socket,
         b_addr,
         &mut a,
+        &a_sources,
         &mut a_counts,
         &b_socket,
         a_addr,
         &mut b,
+        &b_sources,
         &mut b_counts,
         origin,
         |a, b| a.send_ready && b.receive_ready,
     )?;
+    a.reconnect(millis(origin))?;
+    wait_for(
+        &a_socket,
+        b_addr,
+        &mut a,
+        &a_sources,
+        &mut a_counts,
+        &b_socket,
+        a_addr,
+        &mut b,
+        &b_sources,
+        &mut b_counts,
+        origin,
+        |a, b| a.send_ready && a.receive_ready && b.send_ready && b.receive_ready,
+    )?;
+    let fresh_run = RunId::generate()?;
+    b_sources = open_sources(fresh_run)?;
     b = Peer::new(
         second,
         first,
-        RunId::generate()?,
+        fresh_run,
         Intent {
             send: true,
             receive: true,
         },
+        b_sources.publisher.catalogue(),
         millis(origin),
     )?;
     wait_for(
         &a_socket,
         b_addr,
         &mut a,
+        &a_sources,
         &mut a_counts,
         &b_socket,
         a_addr,
         &mut b,
+        &b_sources,
         &mut b_counts,
         origin,
         |a, b| a.send_ready && a.receive_ready && b.send_ready && b.receive_ready,
     )?;
-    frame += FRAMES as u64;
-    let before = b_counts.received_frames;
-    send_fixture(&a_socket, b_addr, &mut a, frame, &mut a_counts)?;
+    let before = b_counts.system_frames;
+    send_both(
+        &a_socket,
+        b_addr,
+        &mut a_sources,
+        &a,
+        480,
+        128,
+        millis(origin),
+        &mut a_counts,
+    )?;
     pump_pair(
         &a_socket,
         b_addr,
         &mut a,
+        &a_sources,
         &mut a_counts,
         &b_socket,
         a_addr,
         &mut b,
+        &b_sources,
         &mut b_counts,
         origin,
     )?;
-    if b_counts.received_frames <= before
+    if b_counts.system_frames <= before
         || a_counts.mismatched_samples + b_counts.mismatched_samples != 0
     {
-        return Err("demo: restart recovery or finite F32 integrity failed".into());
+        return Err("demo: fresh-run recovery or finite F32 integrity failed".into());
     }
     println!(
-        "demo passed: delayed peer startup, UDP handshake, bidirectional PCM, independent receive refusal, regrant, peer restart, exact finite F32 samples"
+        "demo passed: delayed startup, two-source RLP4 fanout, refusal, regrant, same-run reconnect, fresh run, exact finite F32 samples"
     );
     print_summary(&a.status(), &a_counts);
     print_summary(&b.status(), &b_counts);
@@ -537,21 +732,80 @@ fn demo() -> Result<()> {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn send_both(
+    socket: &UdpSocket,
+    endpoint: SocketAddr,
+    sources: &mut Sources,
+    peer: &Peer,
+    start: u64,
+    frames: u64,
+    now: u64,
+    counts: &mut Counts,
+) -> Result<()> {
+    send_source(
+        socket,
+        endpoint,
+        &mut sources.publisher,
+        peer,
+        sources.system,
+        sources.system_acquisition,
+        start,
+        SYSTEM_CHANNELS,
+        frames,
+        now,
+        counts,
+    )?;
+    send_source(
+        socket,
+        endpoint,
+        &mut sources.publisher,
+        peer,
+        sources.microphone,
+        sources.microphone_acquisition,
+        start,
+        MICROPHONE_CHANNELS,
+        frames,
+        now,
+        counts,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
 fn pump_pair(
     a_socket: &UdpSocket,
     b_addr: SocketAddr,
     a: &mut Peer,
+    a_sources: &Sources,
     a_counts: &mut Counts,
     b_socket: &UdpSocket,
     a_addr: SocketAddr,
     b: &mut Peer,
+    b_sources: &Sources,
     b_counts: &mut Counts,
     origin: Instant,
 ) -> Result<()> {
-    for _ in 0..4 {
+    for _ in 0..8 {
         let now = millis(origin);
-        pump(a_socket, b_addr, a, now, true, a_counts)?;
-        pump(b_socket, a_addr, b, now, true, b_counts)?;
+        pump(
+            a_socket,
+            b_addr,
+            a,
+            b_sources.system,
+            b_sources.microphone,
+            now,
+            true,
+            a_counts,
+        )?;
+        pump(
+            b_socket,
+            a_addr,
+            b,
+            a_sources.system,
+            a_sources.microphone,
+            now,
+            true,
+            b_counts,
+        )?;
     }
     Ok(())
 }
@@ -561,10 +815,12 @@ fn wait_for(
     a_socket: &UdpSocket,
     b_addr: SocketAddr,
     a: &mut Peer,
+    a_sources: &Sources,
     a_counts: &mut Counts,
     b_socket: &UdpSocket,
     a_addr: SocketAddr,
     b: &mut Peer,
+    b_sources: &Sources,
     b_counts: &mut Counts,
     origin: Instant,
     predicate: impl Fn(&PeerStatus, &PeerStatus) -> bool,
@@ -572,7 +828,8 @@ fn wait_for(
     let until = Instant::now() + Duration::from_secs(5);
     while Instant::now() < until {
         pump_pair(
-            a_socket, b_addr, a, a_counts, b_socket, a_addr, b, b_counts, origin,
+            a_socket, b_addr, a, a_sources, a_counts, b_socket, a_addr, b, b_sources, b_counts,
+            origin,
         )?;
         if predicate(&a.status(), &b.status()) {
             return Ok(());

@@ -1,0 +1,79 @@
+:root {
+  --color-app: #090d12;
+  --color-panel: #121820;
+  --color-border: #222c37;
+  --color-accent: #2bc3c9;
+  --color-positive: #43d39e;
+  --color-warning: #e1aa41;
+  --color-danger: #dd4f56;
+  --color-info: #37b4c5;
+  --color-muted: #617080;
+  --font-sans:
+    Inter, "Segoe UI Variable Text", "Segoe UI", "Microsoft YaHei UI",
+    "PingFang SC", system-ui, sans-serif;
+  --font-mono:
+    "Cascadia Code", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+
+  color: #9aa7b5;
+  background: var(--color-app);
+  font-family: var(--font-sans);
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  scrollbar-color: #34414d #10161d;
+  scrollbar-width: thin;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  min-width: 320px;
+  min-height: 100%;
+  background: var(--color-app);
+  scroll-behavior: smooth;
+}
+
+body {
+  min-width: 320px;
+  min-height: 100vh;
+  margin: 0;
+  background: var(--color-app);
+}
+
+button,
+select,
+input {
+  font: inherit;
+}
+
+button:focus-visible,
+a:focus-visible,
+select:focus-visible,
+input:focus-visible {
+  outline: 2px solid rgba(57, 207, 212, 0.82);
+  outline-offset: 2px;
+}
+
+button,
+a,
+input,
+select {
+  -webkit-tap-highlight-color: transparent;
+}
+
+code {
+  font-family: var(--font-mono);
+}
+
+::selection {
+  color: #e8ffff;
+  background: rgba(43, 195, 201, 0.28);
+}

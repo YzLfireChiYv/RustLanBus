@@ -1,0 +1,19 @@
+[package]
+name = "rlb-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+base64 = "0.23.1"
+rand = "0.10.2"
+rlb-model = { path = "../rlb-model" }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+thiserror = "2.0.20"
+
+[lints]
+workspace = true

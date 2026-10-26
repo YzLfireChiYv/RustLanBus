@@ -11,6 +11,8 @@ rlb-model.workspace = true
 rlb-audio.workspace = true
 rlb-audio-windows.workspace = true
 rlb-peer.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
 
 [lints]
 workspace = true

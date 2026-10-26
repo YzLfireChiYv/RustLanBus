@@ -247,7 +247,10 @@ pub enum CaptureProcessResult {
 /// Enumeration, device opening, start, stop, and close remain supervisor-side
 /// operations. `process` only copies or converts an available callback buffer
 /// into supplied preallocated storage.
-pub trait CaptureBackend: Send {
+/// Open, use, and drop native implementations on their owning audio thread.
+/// Implementations may be thread-bound; transferring requests and owned PCM
+/// between workers does not require transferring the opened backend itself.
+pub trait CaptureBackend {
     /// Returns the latest atomically published lifecycle state.
     fn status(&self) -> BackendStatus;
 
@@ -263,7 +266,8 @@ pub trait CaptureBackend: Send {
 }
 
 /// Already-opened platform render stream used by its realtime owner.
-pub trait RenderBackend: Send {
+/// Native implementations may require same-thread opening, use, and release.
+pub trait RenderBackend {
     /// Returns the latest atomically published lifecycle state.
     fn status(&self) -> BackendStatus;
 

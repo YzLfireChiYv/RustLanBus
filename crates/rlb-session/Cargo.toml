@@ -1,0 +1,19 @@
+[package]
+name = "rlb-session"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+rlb-audio.workspace = true
+rlb-control.workspace = true
+rlb-media.workspace = true
+rlb-model.workspace = true
+rlb-registry.workspace = true
+serde = { version = "1.0.229", features = ["derive"] }
+url = "2.5.8"
+
+[lints]
+workspace = true

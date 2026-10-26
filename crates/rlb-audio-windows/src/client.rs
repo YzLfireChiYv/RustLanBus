@@ -5,14 +5,15 @@ use windows::Win32::Media::Audio::{
     AUDCLNT_SHAREMODE_SHARED, AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM,
     AUDCLNT_STREAMFLAGS_EVENTCALLBACK, AUDCLNT_STREAMFLAGS_LOOPBACK, AUDCLNT_STREAMOPTIONS_NONE,
     AudioCategory_Media, AudioClientProperties, IAudioCaptureClient, IAudioClient, IAudioClient2,
-    IAudioClient3, IAudioRenderClient, IMMDevice, WAVEFORMATEX,
+    IAudioClient3, IAudioClock, IAudioRenderClient, IMMDevice, WAVEFORMATEX,
 };
 use windows::Win32::System::Com::{CLSCTX_ALL, CoTaskMemFree};
 use windows::Win32::System::Threading::{CreateEventW, WaitForSingleObject};
 use windows::core::Interface;
 
 use crate::endpoint::EndpointEnumerator;
-use crate::format::{hns_to_frames, parse_mix_format};
+use crate::format::{NativeF32Format, NativeFormatReject, hns_to_frames, parse_mix_format};
+use crate::wake::{AudioWake, NativeWake};
 use crate::{WasapiFormat, WindowsAudioError, hresult};
 
 const AUDCLNT_E_UNSUPPORTED_FORMAT: u32 = 0x8889_0008;
@@ -40,6 +41,7 @@ pub enum SharedPeriodPreference {
     #[default]
     Default,
     /// The shortest shared period `IAudioClient3` reports for the engine format.
+    /// Render-endpoint loopback uses classic shared initialization instead.
     Minimum,
 }
 
@@ -116,6 +118,9 @@ pub(crate) struct NativeClient {
     event: StreamEvent,
     pub mix_format: Option<WasapiFormat>,
     pub engine_format: WasapiFormat,
+    /// Present when this client was opened on the endpoint mix format.
+    /// Fixed 48 kHz opens leave it empty.
+    pub native_format: Option<NativeF32Format>,
     pub autoconvert: bool,
     pub iaudioclient3: bool,
     pub buffer_frames: u32,
@@ -141,13 +146,23 @@ impl NativeClient {
         Self::initialize(device, channels, usage, preference)
     }
 
+    pub(crate) fn open_native_pcm(
+        enumerator: &EndpointEnumerator,
+        endpoint_id: &str,
+        usage: ClientUsage,
+        preference: SharedPeriodPreference,
+    ) -> Result<Self, WindowsAudioError> {
+        let device = enumerator.get_device(endpoint_id)?;
+        Self::initialize_native(device, usage, preference)
+    }
+
     fn initialize(
         device: IMMDevice,
         channels: u8,
         usage: ClientUsage,
         preference: SharedPeriodPreference,
     ) -> Result<Self, WindowsAudioError> {
-        let mut client = activate_client(&device)?;
+        let client = activate_client(&device)?;
         if usage != ClientUsage::LoopbackCapture {
             let _ = set_media_category(&client);
         }
@@ -160,11 +175,7 @@ impl NativeClient {
         let engine_wave = crate::format::WasapiFormat::engine_wave_format(channels)?;
         let engine_format = WasapiFormat::from_wave_format(&engine_wave);
 
-        let mut iaudioclient3 = false;
-        let mut autoconvert = false;
-        let mut period_frames = hns_to_frames(default_period_hns, 48_000).max(1);
-        let mut requested_period_frames = period_frames;
-        let mut initialized = false;
+        let classic_frames = hns_to_frames(default_period_hns, engine_format.sample_rate_hz).max(1);
         let engine_period_result = client
             .cast::<IAudioClient3>()
             .map_err(|error| WasapiCallFailure::new("IAudioClient::cast(IAudioClient3)", error))
@@ -173,65 +184,25 @@ impl NativeClient {
             Ok(periods) => (Some(periods), None),
             Err(failure) => (None, Some(failure)),
         };
-        let mut minimum_period_failure = None;
-        let mut default_period_failure = None;
-
-        if preference == SharedPeriodPreference::Minimum {
-            if let Some(periods) = engine_periods {
-                requested_period_frames = periods.minimum_period_frames.max(1);
-                match try_shared_stream(&device, usage, &engine_wave, requested_period_frames) {
-                    Ok(opened) => {
-                        client = opened;
-                        period_frames = requested_period_frames;
-                        iaudioclient3 = true;
-                        initialized = true;
-                    }
-                    Err(failure) => minimum_period_failure = Some(failure),
-                }
-                if !initialized {
-                    match try_shared_stream(
-                        &device,
-                        usage,
-                        &engine_wave,
-                        periods.default_period_frames.max(1),
-                    ) {
-                        Ok(opened) => {
-                            client = opened;
-                            period_frames = periods.default_period_frames.max(1);
-                            iaudioclient3 = true;
-                            initialized = true;
-                        }
-                        Err(failure) => default_period_failure = Some(failure),
-                    }
-                }
-                if !initialized {
-                    client = activate_client(&device)?;
-                    if usage != ClientUsage::LoopbackCapture {
-                        let _ = set_media_category(&client);
-                    }
-                }
-            }
-        } else if usage != ClientUsage::LoopbackCapture {
-            if let Some(periods) = engine_periods {
-                period_frames = periods.default_period_frames.max(1);
-                requested_period_frames = period_frames;
-                match try_shared_stream(&device, usage, &engine_wave, period_frames) {
-                    Ok(opened) => {
-                        client = opened;
-                        iaudioclient3 = true;
-                        initialized = true;
-                    }
-                    Err(failure) => default_period_failure = Some(failure),
-                }
-            }
-            if !initialized {
-                client = activate_client(&device)?;
-                let _ = set_media_category(&client);
-            }
-        }
-
-        if !initialized {
-            period_frames = hns_to_frames(default_period_hns, engine_format.sample_rate_hz).max(1);
+        // InitializeSharedAudioStream does not accept LOOPBACK. The shared
+        // period plan keeps that capture route on classic initialization.
+        let negotiated = negotiate_shared_period(
+            &device,
+            usage,
+            preference,
+            engine_wave.as_waveformatex_ref(),
+            engine_periods,
+            client,
+            classic_frames,
+        )?;
+        let mut autoconvert = false;
+        let client = negotiated.client;
+        let period_frames = negotiated.period_frames;
+        let requested_period_frames = negotiated.requested_period_frames;
+        let iaudioclient3 = negotiated.iaudioclient3;
+        let minimum_period_failure = negotiated.minimum_period_failure;
+        let default_period_failure = negotiated.default_period_failure;
+        if !negotiated.initialized {
             let mix_is_engine = mix_format.is_some_and(|format| format.is_engine_f32(channels));
             autoconvert = !mix_is_engine;
             let format: *const WAVEFORMATEX = if mix_is_engine {
@@ -259,6 +230,7 @@ impl NativeClient {
             event,
             mix_format,
             engine_format,
+            native_format: None,
             autoconvert,
             iaudioclient3,
             buffer_frames,
@@ -270,6 +242,79 @@ impl NativeClient {
             shared_engine_period_failure,
             minimum_period_failure,
             default_period_failure,
+        })
+    }
+
+    fn initialize_native(
+        device: IMMDevice,
+        usage: ClientUsage,
+        preference: SharedPeriodPreference,
+    ) -> Result<Self, WindowsAudioError> {
+        let client = activate_client(&device)?;
+        if usage != ClientUsage::LoopbackCapture {
+            let _ = set_media_category(&client);
+        }
+        let mix_allocation = MixFormatAllocation(
+            unsafe { client.GetMixFormat() }
+                .map_err(|error| hresult("IAudioClient::GetMixFormat", error))?,
+        );
+        let mix_format = unsafe { parse_mix_format(mix_allocation.0) }?;
+        let native = NativeF32Format::from_mix(mix_format)
+            .map_err(|reason| WindowsAudioError::NativeFormatRejected { reason })?;
+        let (default_period_hns, minimum_period_hns) = read_periods(&client);
+        let classic_frames = hns_to_frames(default_period_hns, native.sample_rate_hz).max(1);
+        let period_query = client
+            .cast::<IAudioClient3>()
+            .map_err(|error| WasapiCallFailure::new("IAudioClient::cast(IAudioClient3)", error))
+            .and_then(|client3| shared_engine_periods(&client3, unsafe { &*mix_allocation.0 }));
+        let (shared_periods, shared_engine_period_failure) = match period_query {
+            Ok(periods) => (Some(periods), None),
+            Err(failure) => (None, Some(failure)),
+        };
+        let negotiated = negotiate_shared_period(
+            &device,
+            usage,
+            preference,
+            mix_allocation.0,
+            shared_periods,
+            client,
+            classic_frames,
+        )?;
+        let client = negotiated.client;
+        if !negotiated.initialized {
+            try_initialize(&client, mix_allocation.0, usage, false)
+                .map_err(map_native_initialize)?;
+        }
+        drop(mix_allocation);
+
+        let event = StreamEvent::new()?;
+        unsafe { client.SetEventHandle(event.0) }
+            .map_err(|error| hresult("IAudioClient::SetEventHandle", error))?;
+        let buffer_frames = unsafe { client.GetBufferSize() }
+            .map_err(|error| hresult("IAudioClient::GetBufferSize", error))?;
+        if buffer_frames == 0 {
+            return Err(WindowsAudioError::NativeFormatRejected {
+                reason: NativeFormatReject::EmptyDeviceBuffer,
+            });
+        }
+
+        Ok(Self {
+            client,
+            event,
+            mix_format: Some(mix_format),
+            engine_format: mix_format,
+            native_format: Some(native),
+            autoconvert: false,
+            iaudioclient3: negotiated.iaudioclient3,
+            buffer_frames,
+            period_frames: negotiated.period_frames,
+            requested_period_frames: negotiated.requested_period_frames,
+            default_period_hns,
+            minimum_period_hns,
+            shared_engine_periods: shared_periods,
+            shared_engine_period_failure,
+            minimum_period_failure: negotiated.minimum_period_failure,
+            default_period_failure: negotiated.default_period_failure,
         })
     }
 
@@ -286,6 +331,14 @@ impl NativeClient {
         } else {
             Err(WindowsAudioError::WaitFailed { code: result.0 })
         }
+    }
+
+    pub(crate) fn wait_with_control(
+        &self,
+        control: &AudioWake,
+        timeout_ms: u32,
+    ) -> Result<NativeWake, WindowsAudioError> {
+        control.wait_for_audio(self.event.0, timeout_ms)
     }
 
     pub(crate) fn start(&self) -> Result<(), WindowsAudioError> {
@@ -309,6 +362,11 @@ impl NativeClient {
     pub(crate) fn render_service(&self) -> Result<IAudioRenderClient, WindowsAudioError> {
         unsafe { self.client.GetService() }
             .map_err(|error| hresult("IAudioClient::GetService(IAudioRenderClient)", error))
+    }
+
+    pub(crate) fn clock_service(&self) -> Result<IAudioClock, WasapiCallFailure> {
+        unsafe { self.client.GetService() }
+            .map_err(|error| WasapiCallFailure::new("IAudioClient::GetService(IAudioClock)", error))
     }
 }
 
@@ -370,12 +428,13 @@ fn shared_engine_periods(
     })
 }
 
-fn try_shared_stream(
+fn try_shared_stream_raw(
     device: &IMMDevice,
     usage: ClientUsage,
-    engine_wave: &wasapi::WaveFormat,
+    format: *const WAVEFORMATEX,
     period_frames: u32,
 ) -> Result<IAudioClient, WasapiCallFailure> {
+    debug_assert_ne!(usage, ClientUsage::LoopbackCapture);
     let client = activate_client(device)?;
     if usage != ClientUsage::LoopbackCapture {
         let _ = set_media_category(&client);
@@ -383,20 +442,179 @@ fn try_shared_stream(
     let client3 = client
         .cast::<IAudioClient3>()
         .map_err(|error| WasapiCallFailure::new("IAudioClient::cast(IAudioClient3)", error))?;
-    let mut flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
-    if usage == ClientUsage::LoopbackCapture {
-        flags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
-    }
-    unsafe {
-        client3.InitializeSharedAudioStream(
-            flags,
-            period_frames,
-            engine_wave.as_waveformatex_ref(),
-            None,
-        )
-    }
-    .map_err(|error| WasapiCallFailure::new("IAudioClient3::InitializeSharedAudioStream", error))?;
+    let flags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK;
+    unsafe { client3.InitializeSharedAudioStream(flags, period_frames, format, None) }.map_err(
+        |error| WasapiCallFailure::new("IAudioClient3::InitializeSharedAudioStream", error),
+    )?;
     Ok(client)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PeriodStep {
+    TryMinimum(u32),
+    TryDefault(u32),
+    Reactivate,
+    Classic(u32),
+}
+
+struct PeriodState {
+    period_frames: u32,
+    requested_period_frames: u32,
+    iaudioclient3: bool,
+    initialized: bool,
+    reactivated: bool,
+}
+
+struct PeriodNegotiation {
+    client: IAudioClient,
+    period_frames: u32,
+    requested_period_frames: u32,
+    iaudioclient3: bool,
+    initialized: bool,
+    minimum_period_failure: Option<WasapiCallFailure>,
+    default_period_failure: Option<WasapiCallFailure>,
+}
+
+fn period_steps(
+    preference: SharedPeriodPreference,
+    loopback: bool,
+    periods: Option<SharedEnginePeriods>,
+    classic_frames: u32,
+) -> [Option<PeriodStep>; 4] {
+    let mut steps = [None; 4];
+    if loopback {
+        steps[0] = Some(PeriodStep::Classic(classic_frames));
+        return steps;
+    }
+    match (preference, periods) {
+        (SharedPeriodPreference::Minimum, Some(periods)) => {
+            steps[0] = Some(PeriodStep::TryMinimum(periods.minimum_period_frames.max(1)));
+            steps[1] = Some(PeriodStep::TryDefault(periods.default_period_frames.max(1)));
+            steps[2] = Some(PeriodStep::Reactivate);
+            steps[3] = Some(PeriodStep::Classic(classic_frames));
+        }
+        (SharedPeriodPreference::Minimum, None) => {
+            steps[0] = Some(PeriodStep::Classic(classic_frames));
+        }
+        (SharedPeriodPreference::Default, Some(periods)) => {
+            steps[0] = Some(PeriodStep::TryDefault(periods.default_period_frames.max(1)));
+            steps[1] = Some(PeriodStep::Reactivate);
+            steps[2] = Some(PeriodStep::Classic(classic_frames));
+        }
+        (SharedPeriodPreference::Default, None) => {
+            steps[0] = Some(PeriodStep::Reactivate);
+            steps[1] = Some(PeriodStep::Classic(classic_frames));
+        }
+    }
+    steps
+}
+
+fn advance_period_state(
+    state: &mut PeriodState,
+    preference: SharedPeriodPreference,
+    step: PeriodStep,
+    shared_succeeded: bool,
+) {
+    if state.initialized {
+        return;
+    }
+    match step {
+        PeriodStep::TryMinimum(frames) => {
+            state.requested_period_frames = frames;
+            if shared_succeeded {
+                state.period_frames = frames;
+                state.iaudioclient3 = true;
+                state.initialized = true;
+            }
+        }
+        PeriodStep::TryDefault(frames) => {
+            if preference == SharedPeriodPreference::Default {
+                state.requested_period_frames = frames;
+                state.period_frames = frames;
+            }
+            if shared_succeeded {
+                state.period_frames = frames;
+                state.iaudioclient3 = true;
+                state.initialized = true;
+            }
+        }
+        PeriodStep::Reactivate => state.reactivated = true,
+        PeriodStep::Classic(frames) => state.period_frames = frames,
+    }
+}
+
+fn negotiate_shared_period(
+    device: &IMMDevice,
+    usage: ClientUsage,
+    preference: SharedPeriodPreference,
+    format: *const WAVEFORMATEX,
+    periods: Option<SharedEnginePeriods>,
+    client: IAudioClient,
+    classic_frames: u32,
+) -> Result<PeriodNegotiation, WasapiCallFailure> {
+    let mut state = PeriodState {
+        period_frames: classic_frames,
+        requested_period_frames: classic_frames,
+        iaudioclient3: false,
+        initialized: false,
+        reactivated: false,
+    };
+    let mut client = client;
+    let mut minimum_period_failure = None;
+    let mut default_period_failure = None;
+    let loopback = usage == ClientUsage::LoopbackCapture;
+    for step in period_steps(preference, loopback, periods, classic_frames)
+        .into_iter()
+        .flatten()
+    {
+        if state.initialized {
+            break;
+        }
+        match step {
+            PeriodStep::TryMinimum(frames) | PeriodStep::TryDefault(frames) => {
+                match try_shared_stream_raw(device, usage, format, frames) {
+                    Ok(opened) => {
+                        client = opened;
+                        advance_period_state(&mut state, preference, step, true);
+                    }
+                    Err(failure) => {
+                        if matches!(step, PeriodStep::TryMinimum(_)) {
+                            minimum_period_failure = Some(failure);
+                        } else {
+                            default_period_failure = Some(failure);
+                        }
+                        advance_period_state(&mut state, preference, step, false);
+                    }
+                }
+            }
+            PeriodStep::Reactivate => {
+                client = activate_client(device)?;
+                if !loopback {
+                    let _ = set_media_category(&client);
+                }
+                advance_period_state(&mut state, preference, step, false);
+            }
+            PeriodStep::Classic(_) => advance_period_state(&mut state, preference, step, false),
+        }
+    }
+    Ok(PeriodNegotiation {
+        client,
+        period_frames: state.period_frames,
+        requested_period_frames: state.requested_period_frames,
+        iaudioclient3: state.iaudioclient3,
+        initialized: state.initialized,
+        minimum_period_failure,
+        default_period_failure,
+    })
+}
+
+fn map_native_initialize(error: WindowsAudioError) -> WindowsAudioError {
+    match error {
+        WindowsAudioError::UnsupportedEngineFormat => WindowsAudioError::NativeFormatRejected {
+            reason: NativeFormatReject::DeviceRejectedMixFormat,
+        },
+        other => other,
+    }
 }
 
 fn try_initialize(
@@ -448,5 +666,89 @@ mod tests {
         let error = unsafe { GetHandleInformation(raw, &mut flags) }
             .expect_err("failed stream open must close its event");
         assert_eq!(error.code().0 as u32, 0x8007_0006);
+    }
+
+    fn periods() -> SharedEnginePeriods {
+        SharedEnginePeriods {
+            default_period_frames: 480,
+            fundamental_period_frames: 128,
+            minimum_period_frames: 128,
+            maximum_period_frames: 960,
+        }
+    }
+
+    fn simulate(
+        preference: SharedPeriodPreference,
+        loopback: bool,
+        known_periods: bool,
+        minimum_succeeds: bool,
+        default_succeeds: bool,
+    ) -> PeriodState {
+        let mut state = PeriodState {
+            period_frames: 441,
+            requested_period_frames: 441,
+            iaudioclient3: false,
+            initialized: false,
+            reactivated: false,
+        };
+        let available = known_periods.then(periods);
+        for step in period_steps(preference, loopback, available, 441)
+            .into_iter()
+            .flatten()
+        {
+            let succeeded = match step {
+                PeriodStep::TryMinimum(_) => minimum_succeeds,
+                PeriodStep::TryDefault(_) => default_succeeds,
+                PeriodStep::Reactivate | PeriodStep::Classic(_) => false,
+            };
+            advance_period_state(&mut state, preference, step, succeeded);
+        }
+        state
+    }
+
+    #[test]
+    fn period_plan_keeps_loopback_on_classic_initialization() {
+        let state = simulate(SharedPeriodPreference::Minimum, true, true, true, true);
+        assert!(!state.iaudioclient3);
+        assert!(!state.reactivated);
+        assert!(!state.initialized);
+        assert_eq!(state.period_frames, 441);
+        assert_eq!(state.requested_period_frames, 441);
+    }
+
+    #[test]
+    fn period_plan_falls_back_from_minimum_to_default_then_classic() {
+        let opened = simulate(SharedPeriodPreference::Minimum, false, true, false, true);
+        assert!(opened.initialized);
+        assert!(opened.iaudioclient3);
+        assert!(!opened.reactivated);
+        assert_eq!(opened.period_frames, 480);
+        assert_eq!(opened.requested_period_frames, 128);
+
+        let classic = simulate(SharedPeriodPreference::Minimum, false, true, false, false);
+        assert!(!classic.initialized);
+        assert!(!classic.iaudioclient3);
+        assert!(classic.reactivated);
+        assert_eq!(classic.period_frames, 441);
+        assert_eq!(classic.requested_period_frames, 128);
+
+        let no_range = simulate(SharedPeriodPreference::Minimum, false, false, false, false);
+        assert!(!no_range.reactivated);
+        assert_eq!(no_range.period_frames, 441);
+        assert_eq!(no_range.requested_period_frames, 441);
+    }
+
+    #[test]
+    fn period_plan_default_preference_keeps_requested_frames_across_classic_fallback() {
+        let classic = simulate(SharedPeriodPreference::Default, false, true, false, false);
+        assert!(classic.reactivated);
+        assert!(!classic.initialized);
+        assert_eq!(classic.period_frames, 441);
+        assert_eq!(classic.requested_period_frames, 480);
+
+        let missing = simulate(SharedPeriodPreference::Default, false, false, false, false);
+        assert!(missing.reactivated);
+        assert_eq!(missing.requested_period_frames, 441);
+        assert_eq!(missing.period_frames, 441);
     }
 }

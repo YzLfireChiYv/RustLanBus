@@ -65,6 +65,92 @@ pub enum CaptureDiscontinuity {
     },
 }
 
+/// How a first-frame instant was obtained.
+///
+/// `ReportedCorrelated` is an accepted capture-API pair for
+/// [`CaptureMetadata::start_sample`]. It carries no numeric accuracy bound.
+/// `Estimated` is derived from an existing anchor, or supplied by a documented
+/// synthetic fixture.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum FrameTimeQuality {
+    /// Accepted API timestamp paired with the first frame.
+    ReportedCorrelated,
+    /// Derived or synthetic time in the same local clock domain.
+    Estimated,
+}
+
+/// First-frame instant in the metadata clock domain.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct FrameTimestamp {
+    /// Instant of the block's first source frame.
+    pub at: MonotonicInstant,
+    /// Provenance of `at`.
+    pub quality: FrameTimeQuality,
+}
+
+impl FrameTimestamp {
+    /// Builds a reported API pair from ticks in the caller's clock domain.
+    #[must_use]
+    pub const fn reported(ticks: u64) -> Self {
+        Self {
+            at: MonotonicInstant::from_ticks(ticks),
+            quality: FrameTimeQuality::ReportedCorrelated,
+        }
+    }
+
+    /// Builds an estimated or synthetic instant from ticks in the caller's clock domain.
+    #[must_use]
+    pub const fn estimated(ticks: u64) -> Self {
+        Self {
+            at: MonotonicInstant::from_ticks(ticks),
+            quality: FrameTimeQuality::Estimated,
+        }
+    }
+}
+
+/// Acquisition timing for one capture block.
+///
+/// `first_frame` refers to [`CaptureMetadata::start_sample`] in that metadata's
+/// [`CaptureMetadata::clock_domain`]. `observed_on_owner` is the capture
+/// owner's observation of the packet that contributed the block's first frame,
+/// in the same local domain, with no sample offset applied. `None` means the
+/// measurement is absent. A numeric zero remains a legitimate measured instant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct CaptureTiming {
+    /// Time of the block's first source frame, when an anchor exists.
+    pub first_frame: Option<FrameTimestamp>,
+    /// Owner observation of the contributing packet. Missing stays absent.
+    pub observed_on_owner: Option<MonotonicInstant>,
+}
+
+impl CaptureTiming {
+    /// Both observations are absent.
+    #[must_use]
+    pub const fn absent() -> Self {
+        Self {
+            first_frame: None,
+            observed_on_owner: None,
+        }
+    }
+
+    /// Legacy projection: first-frame instant, otherwise the owner observation,
+    /// otherwise the historical tick-zero sentinel.
+    ///
+    /// Successor code reads [`CaptureTiming`] directly. Tick zero from this
+    /// projection is the old missing-measurement sentinel whenever both
+    /// observations are absent; a real measurement may also be zero.
+    #[must_use]
+    pub const fn compatibility_capture_time(self) -> MonotonicInstant {
+        if let Some(frame) = self.first_frame {
+            frame.at
+        } else if let Some(observed) = self.observed_on_owner {
+            observed
+        } else {
+            MonotonicInstant::from_ticks(0)
+        }
+    }
+}
+
 /// Metadata attached to one variable-sized capture callback block.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CaptureMetadata {
@@ -80,9 +166,16 @@ pub struct CaptureMetadata {
     pub sample_rate_hz: u32,
     /// One or two planar channels.
     pub channels: u8,
-    /// Opaque local clock domain for `capture_time`.
+    /// Opaque local clock domain for [`Self::timing`].
     pub clock_domain: CaptureClockDomain,
-    /// Callback observation in `clock_domain`.
+    /// Authoritative acquisition timing in `clock_domain`.
+    pub timing: CaptureTiming,
+    /// Compatibility projection of `timing` for existing legacy callers.
+    ///
+    /// This is not a second observation. The legacy encoder still treats these
+    /// ticks as its sender-deadline origin; their units and origin can differ
+    /// from that nanosecond clock. New code must not infer first-frame validity
+    /// from this field.
     pub capture_time: MonotonicInstant,
     /// Optional device sample position used for diagnostics.
     pub device_position: Option<u64>,
@@ -735,7 +828,7 @@ pub struct CaptureReblocker {
     scratch: Box<[f32]>,
     scratch_frames: usize,
     scratch_start_sample: u64,
-    scratch_capture_time: MonotonicInstant,
+    scratch_timing: CaptureTiming,
     scratch_device_position: Option<u64>,
     scratch_silent: bool,
     expected_input_start: u64,
@@ -824,7 +917,7 @@ impl CaptureReblocker {
             scratch: vec![0.0; samples].into_boxed_slice(),
             scratch_frames: 0,
             scratch_start_sample: 0,
-            scratch_capture_time: MonotonicInstant::from_ticks(0),
+            scratch_timing: CaptureTiming::absent(),
             scratch_device_position: None,
             scratch_silent: true,
             expected_input_start: 0,
@@ -979,11 +1072,15 @@ impl CaptureReblocker {
 
     fn begin_scratch(&mut self, metadata: CaptureMetadata, input_offset: usize) {
         self.scratch_start_sample = metadata.start_sample.saturating_add(input_offset as u64);
-        self.scratch_capture_time = offset_capture_time(
-            metadata.capture_time,
-            input_offset,
-            metadata.clock_domain.ticks_per_second(),
-        );
+        self.scratch_timing = CaptureTiming {
+            first_frame: estimate_first_frame(
+                metadata.timing.first_frame,
+                input_offset as u64,
+                metadata.sample_rate_hz,
+                metadata.clock_domain.ticks_per_second().get(),
+            ),
+            observed_on_owner: metadata.timing.observed_on_owner,
+        };
         self.scratch_device_position = metadata
             .device_position
             .and_then(|position| position.checked_add(input_offset as u64));
@@ -1092,7 +1189,8 @@ impl CaptureReblocker {
             sample_rate_hz: SAMPLE_RATE_HZ,
             channels: self.channels,
             clock_domain: self.clock_domain,
-            capture_time: self.scratch_capture_time,
+            timing: self.scratch_timing,
+            capture_time: self.scratch_timing.compatibility_capture_time(),
             device_position: self.scratch_device_position,
             discontinuity,
             silent: self.scratch_silent,
@@ -1126,20 +1224,36 @@ fn required_planar_samples(
         })
 }
 
-fn offset_capture_time(
-    capture_time: MonotonicInstant,
-    frame_offset: usize,
-    ticks_per_second: NonZeroU64,
-) -> MonotonicInstant {
-    let ticks = (frame_offset as u128).saturating_mul(u128::from(ticks_per_second.get()))
-        / u128::from(SAMPLE_RATE_HZ);
-    let Ok(ticks) = u64::try_from(ticks) else {
-        return capture_time;
-    };
-    match capture_time.checked_add(MonotonicDuration::from_ticks(ticks)) {
-        Some(adjusted) => adjusted,
-        None => capture_time,
+/// Moves a first-frame anchor forward by whole source frames.
+///
+/// A zero offset retains the anchor and its quality. A positive offset uses
+/// checked `frame_offset * ticks_per_second / sample_rate` arithmetic and marks
+/// the result [`FrameTimeQuality::Estimated`]. A missing anchor or any overflow
+/// stays absent. The previous anchor is not reused as a derived instant.
+pub(crate) fn estimate_first_frame(
+    anchor: Option<FrameTimestamp>,
+    frame_offset: u64,
+    sample_rate_hz: u32,
+    ticks_per_second: u64,
+) -> Option<FrameTimestamp> {
+    if frame_offset == 0 {
+        return anchor;
     }
+    let anchor = anchor?;
+    if sample_rate_hz == 0 || ticks_per_second == 0 {
+        return None;
+    }
+    let ticks = u128::from(frame_offset)
+        .checked_mul(u128::from(ticks_per_second))?
+        .checked_div(u128::from(sample_rate_hz))?;
+    let ticks = u64::try_from(ticks).ok()?;
+    let at = anchor
+        .at
+        .checked_add(MonotonicDuration::from_ticks(ticks))?;
+    Some(FrameTimestamp {
+        at,
+        quality: FrameTimeQuality::Estimated,
+    })
 }
 
 #[cfg(test)]
@@ -1176,6 +1290,13 @@ mod tests {
             sample_rate_hz: SAMPLE_RATE_HZ,
             channels: 2,
             clock_domain: domain(),
+            timing: CaptureTiming {
+                first_frame: Some(FrameTimestamp {
+                    at: MonotonicInstant::from_ticks(10),
+                    quality: FrameTimeQuality::ReportedCorrelated,
+                }),
+                observed_on_owner: None,
+            },
             capture_time: MonotonicInstant::from_ticks(10),
             device_position: Some(start_sample),
             discontinuity: CaptureDiscontinuity::Continuous,
@@ -1372,5 +1493,190 @@ mod tests {
             reblocker.process(input, &mut pool, &mut queue),
             Err(AudioError::DiscontinuityMismatch)
         );
+    }
+
+    #[test]
+    fn reblock_derives_split_anchors_without_inventing_missing_time() {
+        let ticks_per_second = 48_000_u64;
+        let domain = CaptureClockDomain::new(
+            NonZeroU64::new(7).expect("domain"),
+            NonZeroU64::new(ticks_per_second).expect("rate"),
+        );
+        let owner = MonotonicInstant::from_ticks(5_000);
+        let anchor = MonotonicInstant::from_ticks(1_000);
+        let (first, second) = split_two_units(
+            domain,
+            CaptureTiming {
+                first_frame: Some(FrameTimestamp {
+                    at: anchor,
+                    quality: FrameTimeQuality::ReportedCorrelated,
+                }),
+                observed_on_owner: Some(owner),
+            },
+            0,
+        );
+        assert_eq!(first.start_sample, 0);
+        assert_eq!(first.timing.observed_on_owner, Some(owner));
+        assert_eq!(first.timing.first_frame.unwrap().at, anchor);
+        assert_eq!(
+            first.timing.first_frame.unwrap().quality,
+            FrameTimeQuality::ReportedCorrelated
+        );
+        assert_eq!(second.start_sample, 480);
+        assert_eq!(second.timing.observed_on_owner, Some(owner));
+        assert_eq!(second.timing.first_frame.unwrap().at.ticks(), 1_480);
+        assert_eq!(
+            second.timing.first_frame.unwrap().quality,
+            FrameTimeQuality::Estimated
+        );
+
+        let unknown = CaptureTiming {
+            first_frame: None,
+            observed_on_owner: Some(MonotonicInstant::from_ticks(7)),
+        };
+        let (first, second) = split_two_units(domain, unknown, 0);
+        assert!(first.timing.first_frame.is_none());
+        assert!(second.timing.first_frame.is_none());
+        assert_eq!(first.timing.observed_on_owner, unknown.observed_on_owner);
+        assert_eq!(second.timing.observed_on_owner, unknown.observed_on_owner);
+        assert_eq!(second.capture_time.ticks(), 7);
+
+        let overflow = CaptureTiming {
+            first_frame: Some(FrameTimestamp {
+                at: MonotonicInstant::from_ticks(u64::MAX),
+                quality: FrameTimeQuality::ReportedCorrelated,
+            }),
+            observed_on_owner: Some(MonotonicInstant::from_ticks(42)),
+        };
+        let (first, second) = split_two_units(domain, overflow, 0);
+        assert_eq!(first.timing.first_frame.unwrap().at.ticks(), u64::MAX);
+        assert!(second.timing.first_frame.is_none());
+        assert_eq!(second.timing.observed_on_owner.unwrap().ticks(), 42);
+
+        let metrics = Arc::new(AudioMetrics::new());
+        let mut reblocker =
+            CaptureReblocker::new(source_id(), epoch(), 1, domain, metrics).expect("reblocker");
+        let mut pool = CaptureBlockPool::new(2, MEDIA_UNIT_FRAMES_USIZE, 1).expect("pool");
+        let mut queue = BoundedSpsc::new(2).expect("queue");
+        let opened = vec![0.25; MEDIA_UNIT_FRAMES_USIZE * 2];
+        let opened_view = PlanarSamples::new(
+            &opened,
+            MEDIA_UNIT_FRAMES_USIZE * 2,
+            1,
+            MEDIA_UNIT_FRAMES_USIZE * 2,
+        )
+        .expect("view");
+        reblocker
+            .process(
+                CaptureInput::new(
+                    timed_metadata(
+                        domain,
+                        unknown,
+                        0,
+                        u32::try_from(MEDIA_UNIT_FRAMES_USIZE * 2).expect("frames"),
+                        CaptureDiscontinuity::Continuous,
+                    ),
+                    opened_view,
+                )
+                .expect("input"),
+                &mut pool,
+                &mut queue,
+            )
+            .expect("open");
+        for _ in 0..2 {
+            let block = queue.try_pop().expect("opened block");
+            pool.release(block).expect("release");
+        }
+        let continued = vec![0.5; MEDIA_UNIT_FRAMES_USIZE];
+        let continued_view = PlanarSamples::new(
+            &continued,
+            MEDIA_UNIT_FRAMES_USIZE,
+            1,
+            MEDIA_UNIT_FRAMES_USIZE,
+        )
+        .expect("view");
+        let report = reblocker
+            .process(
+                CaptureInput::new(
+                    timed_metadata(
+                        domain,
+                        unknown,
+                        970,
+                        u32::from(MEDIA_UNIT_FRAMES),
+                        CaptureDiscontinuity::KnownGap { missing_frames: 10 },
+                    ),
+                    continued_view,
+                )
+                .expect("input"),
+                &mut pool,
+                &mut queue,
+            )
+            .expect("gapped block");
+        assert_eq!(report.gap_frames, 10);
+        let block = queue.try_pop().expect("block");
+        let metadata = block.metadata().expect("metadata");
+        assert_eq!(metadata.start_sample, 970);
+        assert_eq!(
+            metadata.discontinuity,
+            CaptureDiscontinuity::KnownGap { missing_frames: 10 }
+        );
+    }
+
+    fn split_two_units(
+        domain: CaptureClockDomain,
+        timing: CaptureTiming,
+        start_sample: u64,
+    ) -> (CaptureMetadata, CaptureMetadata) {
+        let metrics = Arc::new(AudioMetrics::new());
+        let mut reblocker =
+            CaptureReblocker::new(source_id(), epoch(), 1, domain, metrics).expect("reblocker");
+        let mut pool = CaptureBlockPool::new(2, MEDIA_UNIT_FRAMES_USIZE, 1).expect("pool");
+        let mut queue = BoundedSpsc::new(2).expect("queue");
+        let frames = MEDIA_UNIT_FRAMES_USIZE * 2;
+        let samples = vec![0.25; frames];
+        let view = PlanarSamples::new(&samples, frames, 1, frames).expect("view");
+        reblocker
+            .process(
+                CaptureInput::new(
+                    timed_metadata(
+                        domain,
+                        timing,
+                        start_sample,
+                        u32::try_from(frames).expect("frames"),
+                        CaptureDiscontinuity::Continuous,
+                    ),
+                    view,
+                )
+                .expect("input"),
+                &mut pool,
+                &mut queue,
+            )
+            .expect("split");
+        let first = queue.try_pop().expect("first").metadata().expect("meta");
+        let second = queue.try_pop().expect("second").metadata().expect("meta");
+        (first, second)
+    }
+
+    fn timed_metadata(
+        domain: CaptureClockDomain,
+        timing: CaptureTiming,
+        start_sample: u64,
+        frames: u32,
+        discontinuity: CaptureDiscontinuity,
+    ) -> CaptureMetadata {
+        CaptureMetadata {
+            source_id: source_id(),
+            stream_epoch: epoch(),
+            start_sample,
+            frames,
+            sample_rate_hz: SAMPLE_RATE_HZ,
+            channels: 1,
+            clock_domain: domain,
+            timing,
+            capture_time: timing.compatibility_capture_time(),
+            device_position: Some(start_sample),
+            discontinuity,
+            silent: false,
+        }
     }
 }

@@ -1,12 +1,13 @@
 use core::mem;
 
-use rlb_clock::{MonotonicDuration, MonotonicInstant};
+use rlb_clock::MonotonicInstant;
 use rlb_model::{SAMPLE_RATE_HZ, SourceId, StreamEpoch};
 
+use crate::capture::estimate_first_frame;
 use crate::{
     AudioError, BackendStatus, CaptureBackend, CaptureClockDomain, CaptureDiscontinuity,
-    CaptureMetadata, CaptureProcessBuffer, CaptureProcessResult, EndpointDescriptor, RenderBackend,
-    SourceReadOutcome, SourceReader,
+    CaptureMetadata, CaptureProcessBuffer, CaptureProcessResult, CaptureTiming, EndpointDescriptor,
+    FrameTimeQuality, FrameTimestamp, RenderBackend, SourceReadOutcome, SourceReader,
 };
 
 /// Deterministic, preallocated capture backend for tests and simulations.
@@ -191,6 +192,21 @@ impl CaptureBackend for FakeCapture {
         }
 
         let start_sample = self.source_sample;
+        // The fixture time is Estimated from the origin plus source time,
+        // including explicitly skipped frames. The sample cursor only selects
+        // PCM storage. This backend has no separate owner clock.
+        let timing = CaptureTiming {
+            first_frame: estimate_first_frame(
+                Some(FrameTimestamp {
+                    at: self.initial_capture_time,
+                    quality: FrameTimeQuality::Estimated,
+                }),
+                start_sample,
+                SAMPLE_RATE_HZ,
+                self.clock_domain.ticks_per_second().get(),
+            ),
+            observed_on_owner: None,
+        };
         let metadata = CaptureMetadata {
             source_id: self.source_id,
             stream_epoch: self.stream_epoch,
@@ -201,11 +217,8 @@ impl CaptureBackend for FakeCapture {
             sample_rate_hz: SAMPLE_RATE_HZ,
             channels: self.channels,
             clock_domain: self.clock_domain,
-            capture_time: offset_time(
-                self.initial_capture_time,
-                self.sample_cursor,
-                self.clock_domain,
-            ),
+            capture_time: timing.compatibility_capture_time(),
+            timing,
             device_position: Some(start_sample),
             discontinuity: mem::take(&mut self.next_discontinuity),
             silent: self.fixture_range_is_silent(self.sample_cursor, frames),
@@ -331,22 +344,6 @@ impl RenderBackend for FakeRender {
         self.callback_count = self.callback_count.saturating_add(1);
         self.rendered_frames = self.rendered_frames.saturating_add(frames as u64);
         Ok(())
-    }
-}
-
-fn offset_time(
-    initial: MonotonicInstant,
-    frame_offset: usize,
-    domain: CaptureClockDomain,
-) -> MonotonicInstant {
-    let ticks = (frame_offset as u128).saturating_mul(u128::from(domain.ticks_per_second().get()))
-        / u128::from(SAMPLE_RATE_HZ);
-    let Ok(ticks) = u64::try_from(ticks) else {
-        return initial;
-    };
-    match initial.checked_add(MonotonicDuration::from_ticks(ticks)) {
-        Some(adjusted) => adjusted,
-        None => initial,
     }
 }
 
@@ -491,6 +488,8 @@ mod tests {
             panic!("first block");
         };
         assert_eq!(first.start_sample, 0);
+        assert_eq!(first.timing.first_frame, Some(FrameTimestamp::estimated(0)));
+        assert!(first.timing.observed_on_owner.is_none());
         capture.skip_source_frames(7).expect("gap");
         let CaptureProcessResult::Captured(second) =
             capture.process(&mut destination).expect("second")
@@ -498,6 +497,12 @@ mod tests {
             panic!("second block");
         };
         assert_eq!(second.start_sample, 17);
+        assert_eq!(
+            second.timing.first_frame,
+            Some(FrameTimestamp::estimated(17 * 1_000_000_000 / 48_000))
+        );
+        assert!(second.timing.observed_on_owner.is_none());
+        assert_eq!(capture.emitted_frames(), 20);
         assert_eq!(
             second.discontinuity,
             CaptureDiscontinuity::KnownGap { missing_frames: 7 }

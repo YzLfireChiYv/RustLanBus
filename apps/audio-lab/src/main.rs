@@ -1,4 +1,8 @@
 #[cfg(windows)]
+mod cli;
+#[cfg(windows)]
+mod profile;
+#[cfg(windows)]
 mod windows;
 
 fn main() {

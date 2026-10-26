@@ -1,0 +1,16 @@
+[package]
+name = "rustlanbus-short-path"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+rust-version.workspace = true
+
+[[bin]]
+name = "rustlanbus-short-path"
+path = "src/main.rs"
+
+[dependencies]
+rlb-audio.workspace = true
+rlb-audio-windows.workspace = true
+rlb-model.workspace = true

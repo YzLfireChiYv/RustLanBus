@@ -10,15 +10,26 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use rlb_audio::{
-    CaptureBackend, CaptureProcessBuffer, CaptureProcessResult, DirectPcmPlayout,
-    DirectPlayoutConfig, EndpointDirection, EndpointState, PcmPacket, RenderBackend,
+    CaptureBackend, CaptureMetadata, CaptureProcessBuffer, CaptureProcessResult, DirectPcmPlayout,
+    DirectPlayoutConfig, EndpointDirection, EndpointState, FrameTimeQuality, PcmPacket,
+    RenderBackend,
 };
 use rlb_audio_windows::{
-    CaptureFlow, CaptureRequest, EndpointEnumerator, EndpointSelection, EventWait,
-    MmcssRegistration, RenderRequest, SharedPeriodPreference, WasapiFormat, wasapi_qpc_100ns_now,
+    CaptureFlow, CaptureRequest, EndpointCatalog, EndpointEnumerator, EndpointSelection, EventWait,
+    MmcssRegistration, RenderRequest, SampleEncoding, SharedPeriodPreference, WasapiFormat,
+    wasapi_clock_domain, wasapi_qpc_100ns_now,
+};
+
+use crate::cli::{self, Command, LoopRoute, ProbeRoute};
+use crate::profile::{
+    self, CatalogDirection, CatalogEndpoint, CatalogState, EndpointFormat, PlaybackMode,
+    RouteCatalog, SourceKind,
 };
 use rlb_model::{MemberId, RunId, SourceId, StreamEpoch};
-use rlb_peer::{Intent, MAX_DATAGRAM_BYTES, Peer};
+use rlb_peer::{
+    Catalogue, ChannelLayout, Intent, MAX_DATAGRAM_BYTES, PcmEncoding, PcmFormat, Peer,
+    SourceKind as PublicationKind, SourcePublisher,
+};
 
 type Result<T> = std::result::Result<T, Box<dyn Error + Send + Sync>>;
 const RATE: u32 = 48_000;
@@ -29,20 +40,19 @@ const CAPTURE_MAX_AGE_HNS: u64 = 1_000_000; // 100 ms, a diagnostic stale cutoff
 
 pub fn run() -> Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
-    match args.first().map(String::as_str) {
-        Some("devices") => devices(),
-        Some("probe") => probe(&args[1..]),
-        Some("loopback") => loopback(&args[1..]),
-        _ => Err("usage: rustlanbus-audio-lab devices\n       rustlanbus-audio-lab probe --source N --output N\n       rustlanbus-audio-lab loopback --source N --output N --seconds N [--play remote|local|mix|mute] [--local-gain 0..1] [--remote-gain 0..1] [--buffer-periods 1..8]".into()),
+    match cli::parse(&args)? {
+        Command::Devices => devices(),
+        Command::Probe(route) => probe(route),
+        Command::Loopback { route, seconds } => loopback(route, seconds),
+        Command::ProfileInit {
+            path,
+            source_index,
+            output_index,
+            playback,
+        } => profile_init(&path, source_index, output_index, playback),
+        Command::ProfileInspect(path) => inspect_profile(&path),
+        Command::ProfilePreflight(path) => preflight_profile(&path),
     }
-}
-
-fn value<'a>(args: &'a [String], key: &str) -> Result<&'a str> {
-    args.iter()
-        .position(|arg| arg == key)
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
-        .ok_or_else(|| format!("missing {key}").into())
 }
 
 fn devices() -> Result<()> {
@@ -70,9 +80,14 @@ fn native_stereo(format: WasapiFormat) -> bool {
     format.is_engine_f32(CHANNELS) && matches!(format.channel_mask, 0 | 3)
 }
 
-fn route(args: &[String]) -> Result<(SourceRoute, String)> {
-    let source_index: usize = value(args, "--source")?.parse()?;
-    let output_index: usize = value(args, "--output")?.parse()?;
+struct IndexSelection {
+    source: SourceRoute,
+    output_id: String,
+    source_label: String,
+    output_label: String,
+}
+
+fn resolve_indexes(source_index: usize, output_index: usize) -> Result<IndexSelection> {
     let enumerator = EndpointEnumerator::new()?;
     let catalog = enumerator.enumerate()?;
     let source = catalog
@@ -121,18 +136,22 @@ fn route(args: &[String]) -> Result<(SourceRoute, String)> {
             return Err("choose a physical catalog endpoint for loopback acquisition".into());
         }
     };
-    println!(
-        "original source={}\nplayback output={}",
-        source.friendly_name(),
-        output.friendly_name()
-    );
-    Ok((
-        SourceRoute {
+    Ok(IndexSelection {
+        source: SourceRoute {
             id: source.endpoint_id().to_owned(),
             flow,
         },
-        output.endpoint_id().to_owned(),
-    ))
+        output_id: output.endpoint_id().to_owned(),
+        source_label: source.friendly_name().to_owned(),
+        output_label: output.friendly_name().to_owned(),
+    })
+}
+
+fn print_index_selection(selection: &IndexSelection) {
+    println!(
+        "original source={}\nplayback output={}",
+        selection.source_label, selection.output_label
+    );
 }
 
 fn capture_request(source: SourceRoute) -> Result<CaptureRequest> {
@@ -145,18 +164,43 @@ fn capture_request(source: SourceRoute) -> Result<CaptureRequest> {
     })
 }
 
-fn probe(args: &[String]) -> Result<()> {
-    let (source, output) = route(args)?;
+fn probe(route: ProbeRoute) -> Result<()> {
+    let (source, output) = match route {
+        ProbeRoute::Indexes { source, output } => {
+            let selection = resolve_indexes(source, output)?;
+            print_index_selection(&selection);
+            (selection.source, selection.output_id)
+        }
+        ProbeRoute::Profile(path) => {
+            let loaded = profile::load_profile(&path)?;
+            println!("probe_playback=not_started");
+            resolve_saved_route(&loaded)?
+        }
+    };
+    open_probe_streams(source, output)
+}
+
+/// Opens the existing capture and render streams and returns before start.
+fn open_probe_streams(source: SourceRoute, output: String) -> Result<()> {
     // Keep the COM apartment alive until both streams and their services drop.
     let enumerator = EndpointEnumerator::new()?;
     let capture = enumerator
         .open_capture_with_period(capture_request(source)?, SharedPeriodPreference::Minimum)?;
+    let capture_diagnostics = capture.diagnostics();
+    if capture_diagnostics.autoconvert || !capture_diagnostics.mix_format.is_some_and(native_stereo)
+    {
+        return Err("capture format changed or requires Windows conversion".into());
+    }
     let render = enumerator.open_render_with_period(
         RenderRequest {
             selection: EndpointSelection::fixed(output),
         },
         SharedPeriodPreference::Minimum,
     )?;
+    let render_diagnostics = render.diagnostics();
+    if render_diagnostics.autoconvert || !render_diagnostics.mix_format.is_some_and(native_stereo) {
+        return Err("output format changed or requires Windows conversion".into());
+    }
     println!(
         "capture={:?}\nrender={:?}\ninitial output padding={} frames",
         capture.diagnostics(),
@@ -165,6 +209,124 @@ fn probe(args: &[String]) -> Result<()> {
     );
     println!("probe opened streams without starting capture or playback");
     Ok(())
+}
+
+/// Reads the profile file and prints its saved choices. No enumerator and no stream.
+fn inspect_profile(path: &std::path::Path) -> Result<()> {
+    let loaded = profile::load_profile(path)?;
+    println!("{}", loaded.inspection_report());
+    Ok(())
+}
+
+/// Compares the saved ids with the current catalog. This does not open or start a stream.
+fn preflight_profile(path: &std::path::Path) -> Result<()> {
+    let loaded = profile::load_profile(path)?;
+    let enumerator = EndpointEnumerator::new()?;
+    let catalog = route_catalog(&enumerator.enumerate()?);
+    println!("{}", loaded.preflight_report(&catalog));
+    Ok(())
+}
+
+fn profile_init(
+    path: &std::path::Path,
+    source_index: usize,
+    output_index: usize,
+    playback: profile::SavedPlayback,
+) -> Result<()> {
+    let selection = resolve_indexes(source_index, output_index)?;
+    let kind = match selection.source.flow {
+        CaptureFlow::Loopback => SourceKind::RenderLoopback,
+        CaptureFlow::Microphone => SourceKind::CaptureEndpoint,
+    };
+    let profile = profile::RouteProfile::from_selection(
+        &selection.source.id,
+        kind,
+        Some(&selection.source_label),
+        &selection.output_id,
+        Some(&selection.output_label),
+        playback,
+    )?;
+    profile::create_profile(path, &profile)?;
+    println!("{}", profile.saved_configuration());
+    println!("profile_path={}", path.display());
+    println!("Init wrote the profile. Loading the file starts no audio, and no stream was opened.");
+    Ok(())
+}
+
+fn resolve_saved_route(profile: &profile::RouteProfile) -> Result<(SourceRoute, String)> {
+    let enumerator = EndpointEnumerator::new()?;
+    let catalog = route_catalog(&enumerator.enumerate()?);
+    println!("{}", profile.preflight_report(&catalog));
+    checked_saved_route(profile, &catalog)
+}
+
+fn checked_saved_route(
+    profile: &profile::RouteProfile,
+    catalog: &RouteCatalog,
+) -> Result<(SourceRoute, String)> {
+    profile.require_catalog_eligible(catalog)?;
+    let flow = match profile.source_kind() {
+        SourceKind::RenderLoopback => CaptureFlow::Loopback,
+        SourceKind::CaptureEndpoint => CaptureFlow::Microphone,
+    };
+    Ok((
+        SourceRoute {
+            id: profile.source_id().to_owned(),
+            flow,
+        },
+        profile.output_id().to_owned(),
+    ))
+}
+
+fn playback_options(playback: profile::SavedPlayback) -> PlaybackOptions {
+    PlaybackOptions {
+        mode: match playback.mode {
+            PlaybackMode::Remote => Playback::Remote,
+            PlaybackMode::Local => Playback::Local,
+            PlaybackMode::Mix => Playback::Mix,
+            PlaybackMode::Mute => Playback::Mute,
+        },
+        local_gain: playback.local_gain,
+        remote_gain: playback.remote_gain,
+        buffer_periods: usize::from(playback.buffer_periods),
+    }
+}
+
+fn project_format(format: WasapiFormat) -> EndpointFormat {
+    EndpointFormat {
+        sample_rate_hz: format.sample_rate_hz,
+        channels: format.channels,
+        bits_per_sample: format.bits_per_sample,
+        valid_bits_per_sample: format.valid_bits_per_sample,
+        block_align: format.block_align,
+        channel_mask: format.channel_mask,
+        float32: matches!(format.encoding, SampleEncoding::Float),
+    }
+}
+
+fn route_catalog(catalog: &EndpointCatalog) -> RouteCatalog {
+    RouteCatalog::from_endpoints(
+        catalog
+            .endpoints()
+            .iter()
+            .map(|endpoint| CatalogEndpoint {
+                id: endpoint.endpoint_id().to_owned(),
+                label: endpoint.friendly_name().to_owned(),
+                direction: match endpoint.direction() {
+                    EndpointDirection::Render => CatalogDirection::Render,
+                    EndpointDirection::Capture => CatalogDirection::Capture,
+                    EndpointDirection::LoopbackCapture => CatalogDirection::Other,
+                },
+                state: match endpoint.state() {
+                    EndpointState::Active => CatalogState::Active,
+                    EndpointState::Disabled => CatalogState::Disabled,
+                    EndpointState::Unplugged => CatalogState::Unplugged,
+                    EndpointState::NotPresent => CatalogState::NotPresent,
+                },
+                format: endpoint.mix_format().map(project_format),
+            })
+            .collect(),
+    )
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -306,34 +468,70 @@ fn millis(origin: Instant) -> u64 {
     origin.elapsed().as_millis().try_into().unwrap_or(u64::MAX)
 }
 
-fn loopback(args: &[String]) -> Result<()> {
-    let (source, output) = route(args)?;
-    let seconds: u64 = value(args, "--seconds")?.parse()?;
+/// Source age uses a reported first-frame QPC instant in the WASAPI domain.
+///
+/// Owner observations, estimated times, timestamp errors, and other clock
+/// domains stay absent here. Absence is separate from a measured zero.
+fn reported_first_frame_hns(metadata: &CaptureMetadata) -> Option<u64> {
+    if metadata.clock_domain != wasapi_clock_domain() {
+        return None;
+    }
+    let frame = metadata.timing.first_frame?;
+    if frame.quality != FrameTimeQuality::ReportedCorrelated {
+        return None;
+    }
+    Some(frame.at.ticks())
+}
+
+fn publication_stale(queue_age_ms: u64, source_age_hns: Option<u64>) -> bool {
+    queue_age_ms > 100 || source_age_hns.is_some_and(|age| age > CAPTURE_MAX_AGE_HNS)
+}
+
+fn capture_age_hns(captured: Option<u64>, current: Option<u64>) -> Option<u64> {
+    current?.checked_sub(captured?)
+}
+
+fn loopback(route: LoopRoute, seconds: u64) -> Result<()> {
+    let (source, output, options) = match route {
+        LoopRoute::Indexes {
+            source,
+            output,
+            playback,
+        } => {
+            let selection = resolve_indexes(source, output)?;
+            print_index_selection(&selection);
+            (
+                selection.source,
+                selection.output_id,
+                playback_options(playback),
+            )
+        }
+        LoopRoute::Profile(path) => {
+            let loaded = profile::load_profile(&path)?;
+            println!(
+                "This command applies the saved source, output, playback mode, gains, and buffer period."
+            );
+            println!("Peer identity and bilateral consent stay outside the saved route.");
+            let (source, output) = resolve_saved_route(&loaded)?;
+            (source, output, playback_options(loaded.playback()))
+        }
+    };
+    run_bounded_loopback(source, output, seconds, options)
+}
+
+fn run_bounded_loopback(
+    source: SourceRoute,
+    output: String,
+    seconds: u64,
+    options: PlaybackOptions,
+) -> Result<()> {
     if seconds == 0 || seconds > 300 {
         return Err("seconds must be 1..300 for this bounded experiment".into());
     }
-    let playback = match args
-        .iter()
-        .position(|arg| arg == "--play")
-        .and_then(|i| args.get(i + 1))
-        .map(String::as_str)
-    {
-        None | Some("remote") => Playback::Remote,
-        Some("local") => Playback::Local,
-        Some("mix") => Playback::Mix,
-        Some("mute") => Playback::Mute,
-        _ => return Err("play must be remote, local, mix or mute".into()),
-    };
-    let local_gain = gain(args, "--local-gain")?;
-    let remote_gain = gain(args, "--remote-gain")?;
-    let buffer_periods = if args.iter().any(|arg| arg == "--buffer-periods") {
-        value(args, "--buffer-periods")?.parse::<usize>()?
-    } else {
-        2
-    };
-    if !(1..=8).contains(&buffer_periods) {
-        return Err("buffer periods must be 1..8".into());
-    }
+    let playback = options.mode;
+    let local_gain = options.local_gain;
+    let remote_gain = options.remote_gain;
+    let buffer_periods = options.buffer_periods;
     println!(
         "UDP self-loop: play={playback:?} local_gain={local_gain} remote_gain={remote_gain}; no limiter or ASRC"
     );
@@ -364,6 +562,10 @@ fn loopback(args: &[String]) -> Result<()> {
             )
         },
     )?);
+    let selected_kind = match source.flow {
+        CaptureFlow::Loopback => PublicationKind::System,
+        CaptureFlow::Microphone => PublicationKind::Microphone,
+    };
     let stop = Arc::clone(&workers.stop);
     workers.capture = Some(
         thread::Builder::new()
@@ -380,14 +582,36 @@ fn loopback(args: &[String]) -> Result<()> {
     b_socket.set_nonblocking(true)?;
     let a_id = MemberId::generate()?;
     let b_id = MemberId::generate()?;
+    let selected = SourceId::generate()?;
+    let unbound = SourceId::generate()?;
+    let unbound_kind = match selected_kind {
+        PublicationKind::System => PublicationKind::Microphone,
+        PublicationKind::Microphone => PublicationKind::System,
+    };
+    let sender_run = RunId::generate()?;
+    let mut publisher = SourcePublisher::new(sender_run);
+    publisher.register(selected, selected_kind, true)?;
+    publisher.register(unbound, unbound_kind, false)?;
+    let format = PcmFormat::new(RATE, ChannelLayout::StereoLeftRight, PcmEncoding::F32Le, 32)?;
+    let acquisition = StreamEpoch::generate()?;
+    let mut pending = Some(
+        publisher
+            .begin_binding(selected, acquisition, format)?
+            .pending
+            .ok_or("the selected capture binding was not reserved")?,
+    );
+    println!(
+        "Publication binds only the selected capture. The other saved source stays disabled and no second device is opened."
+    );
     let mut a = Peer::new(
         a_id,
         b_id,
-        RunId::generate()?,
+        sender_run,
         Intent {
             send: true,
             receive: false,
         },
+        publisher.catalogue(),
         0,
     )?;
     let mut b = Peer::new(
@@ -398,12 +622,17 @@ fn loopback(args: &[String]) -> Result<()> {
             send: false,
             receive: true,
         },
+        Catalogue::new(Vec::new())?,
         0,
     )?;
+    let mut committed = false;
     let mut encoded_frames = 0_u64;
     let mut received_frames = 0_u64;
     let mut stale_capture_frames = 0_u64;
+    let mut source_age_unknown_frames = 0_u64;
     let mut rejected = 0_u64;
+    // This legacy diagnostic captures F32. Widen exactly for the shared PCM API.
+    let mut original_pcm = Vec::with_capacity(MAX_FRAMES * usize::from(CHANNELS));
     while origin.elapsed() < Duration::from_secs(seconds) && !workers.stop.load(Ordering::Relaxed) {
         let now = millis(origin);
         pump(&a_socket, &mut a, now, |_, _, _, _| {}, &mut rejected)?;
@@ -422,10 +651,12 @@ fn loopback(args: &[String]) -> Result<()> {
                 break;
             };
             let samples = &block.samples[..block.frames * 2];
-            let stale = millis(origin).saturating_sub(block.arrival_ms) > 100
-                || block.capture_hns.zip(wasapi_qpc_100ns_now()).is_some_and(
-                    |(captured, current)| current.saturating_sub(captured) > CAPTURE_MAX_AGE_HNS,
-                );
+            let source_age = capture_age_hns(block.capture_hns, wasapi_qpc_100ns_now());
+            if source_age.is_none() {
+                source_age_unknown_frames += block.frames as u64;
+            }
+            let stale =
+                publication_stale(millis(origin).saturating_sub(block.arrival_ms), source_age);
             if stale {
                 stale_capture_frames += block.frames as u64;
             } else {
@@ -433,10 +664,34 @@ fn loopback(args: &[String]) -> Result<()> {
                     local_tx.copy(samples, block.epoch, block.start, block.arrival_ms);
                 }
                 if a.status().send_ready {
-                    for packet in a.encode_original(RATE, CHANNELS, block.start, samples)? {
-                        send(&a_socket, &packet)?;
+                    if !committed {
+                        let request = pending
+                            .take()
+                            .ok_or("the selected capture binding was already consumed")?;
+                        publisher.commit_binding(request, acquisition, block.start)?;
+                        a.install_catalogue(&publisher.catalogue(), now)?;
+                        committed = true;
                     }
-                    encoded_frames += block.frames as u64;
+                    original_pcm.clear();
+                    original_pcm.extend(samples.iter().copied().map(f64::from));
+                    let original = publisher.local_original(
+                        selected,
+                        acquisition,
+                        block.start,
+                        &original_pcm,
+                        block.arrival_ms,
+                    )?;
+                    let prepared = publisher.prepare_pcm(original)?;
+                    let mut forwarded = false;
+                    for packet in prepared.as_slice() {
+                        if let Some(bytes) = a.write_original(packet)? {
+                            send(&a_socket, &bytes)?;
+                            forwarded = true;
+                        }
+                    }
+                    if forwarded {
+                        encoded_frames += block.frames as u64;
+                    }
                 }
             }
             original_rx.release(block)?;
@@ -446,22 +701,10 @@ fn loopback(args: &[String]) -> Result<()> {
     }
     workers.finish()?;
     println!(
-        "encoded_source_frames={encoded_frames} received_frames={received_frames} stale_capture_frames={stale_capture_frames} rejected_datagrams={rejected} local_queue_drops={} remote_queue_drops={}",
+        "encoded_source_frames={encoded_frames} received_frames={received_frames} stale_capture_frames={stale_capture_frames} source_age_unknown_frames={source_age_unknown_frames} rejected_datagrams={rejected} local_queue_drops={} remote_queue_drops={}",
         local_tx.dropped, remote_tx.dropped
     );
     Ok(())
-}
-
-fn gain(args: &[String], key: &str) -> Result<f32> {
-    let gain = if args.iter().any(|arg| arg == key) {
-        value(args, key)?.parse()?
-    } else {
-        1.0_f32
-    };
-    if !gain.is_finite() || !(0.0..=1.0).contains(&gain) {
-        return Err(format!("{key} must be finite in 0..1").into());
-    }
-    Ok(gain)
 }
 
 fn send(socket: &UdpSocket, packet: &[u8]) -> Result<()> {
@@ -482,15 +725,22 @@ fn pump(
 ) -> Result<()> {
     peer.tick(now)?;
     let mut bytes = [0_u8; MAX_DATAGRAM_BYTES + 1];
+    let mut f32_samples = Vec::with_capacity(MAX_DATAGRAM_BYTES / 4);
     for _ in 0..64 {
         match socket.recv(&mut bytes) {
-            Ok(length) => match peer.ingest(&bytes[..length], now) {
-                Ok(Some(packet)) if packet.sample_rate == RATE && packet.channels == CHANNELS => {
+            Ok(length) => match peer.ingest(&bytes[..length], now, now) {
+                Ok(Some(packet))
+                    if packet.sample_rate() == RATE && packet.channels() == u16::from(CHANNELS)
+                        && packet.format.encoding() == PcmEncoding::F32Le =>
+                {
+                    // Only original F32 publications enter this F32-only lab sink.
+                    f32_samples.clear();
+                    f32_samples.extend(packet.samples.iter().map(|sample| *sample as f32));
                     audio(
-                        packet.source_epoch,
+                        packet.epoch.get(),
                         packet.start_frame,
-                        &packet.samples,
-                        now,
+                        &f32_samples,
+                        packet.arrived_at_ms,
                     )
                 }
                 Ok(Some(_)) | Err(_) => *rejected += 1,
@@ -561,7 +811,7 @@ fn capture_thread(
                             block.start = metadata.start_sample;
                             block.epoch = 0;
                             block.arrival_ms = millis(origin);
-                            block.capture_hns = Some(metadata.capture_time.ticks());
+                            block.capture_hns = reported_first_frame_hns(&metadata);
                             output.submit(block);
                         }
                     }
@@ -633,6 +883,11 @@ fn render_thread(
         let _mmcss = MmcssRegistration::register_pro_audio()?;
         let mut over_unity_samples = 0_u64;
         let mut queue_expired_frames = 0_u64;
+        let mut clock_observations = 0_u64;
+        let mut degraded_clock_observations = 0_u64;
+        let mut clock_observation_failures = 0_u64;
+        let mut last_clock_observation = None;
+        let mut last_clock_failure = None;
         println!("render opened: {diagnostics:?}; playout={config:?}");
         stream.start()?;
         while !stop.load(Ordering::Relaxed) {
@@ -645,6 +900,19 @@ fn render_thread(
             // Refill one event quantum, keeping the PCM window consistent with
             // the source backlog. A fully empty device buffer must not make us
             // consume future source frames before they could have arrived.
+            // These adjacent clock/padding calls form separate observations;
+            // no equation between clock progress and padding is assumed here.
+            match stream.clock_observation() {
+                Ok(observation) => {
+                    clock_observations += 1;
+                    degraded_clock_observations += u64::from(observation.is_degraded());
+                    last_clock_observation = Some(observation);
+                }
+                Err(error) => {
+                    clock_observation_failures += 1;
+                    last_clock_failure = Some(error);
+                }
+            }
             let frames = (stream.available_frames()? as usize).min(render_quantum);
             if frames == 0 {
                 continue;
@@ -668,7 +936,7 @@ fn render_thread(
         }
         stream.stop()?;
         println!(
-            "render stopped: {:?}; own={:?}; returned={:?}; queue_expired_frames={queue_expired_frames}; over_unity_samples={over_unity_samples}",
+            "render stopped: {:?}; own={:?}; returned={:?}; queue_expired_frames={queue_expired_frames}; over_unity_samples={over_unity_samples}; clock_observations={clock_observations}; degraded_clock_observations={degraded_clock_observations}; clock_observation_failures={clock_observation_failures}; last_clock_observation={last_clock_observation:?}; last_clock_failure={last_clock_failure:?}",
             stream.diagnostics(),
             own.stats(),
             returned.stats()
@@ -749,6 +1017,128 @@ fn mix(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rlb_audio::{CaptureClockDomain, CaptureTiming, FrameTimestamp};
+
+    fn reported(at: u64) -> CaptureTiming {
+        CaptureTiming {
+            first_frame: Some(FrameTimestamp::reported(at)),
+            observed_on_owner: Some(FrameTimestamp::reported(at.saturating_add(1)).at),
+        }
+    }
+
+    fn age(timing: CaptureTiming, domain: CaptureClockDomain, current: Option<u64>) -> Option<u64> {
+        let metadata = CaptureMetadata {
+            source_id: SourceId::from_bytes([1; 16]).expect("source"),
+            stream_epoch: StreamEpoch::from_bytes([2; 16]).expect("epoch"),
+            start_sample: 0,
+            frames: 1,
+            sample_rate_hz: RATE,
+            channels: CHANNELS,
+            clock_domain: domain,
+            timing,
+            capture_time: timing.compatibility_capture_time(),
+            device_position: None,
+            discontinuity: rlb_audio::CaptureDiscontinuity::Continuous,
+            silent: false,
+        };
+        capture_age_hns(reported_first_frame_hns(&metadata), current)
+    }
+
+    #[test]
+    fn callback_fallback_cannot_claim_a_fresh_first_frame() {
+        let domain = wasapi_clock_domain();
+        assert_eq!(age(reported(10), domain, Some(100)), Some(90));
+        assert_eq!(age(reported(0), domain, Some(100)), Some(100));
+
+        let callback_only = CaptureTiming {
+            first_frame: None,
+            observed_on_owner: Some(FrameTimestamp::reported(100).at),
+        };
+        assert_eq!(callback_only.compatibility_capture_time().ticks(), 100);
+        assert_eq!(age(callback_only, domain, Some(100)), None);
+
+        let estimated = CaptureTiming {
+            first_frame: Some(FrameTimestamp::estimated(0)),
+            observed_on_owner: None,
+        };
+        assert_eq!(age(estimated, domain, Some(100)), None);
+        assert_eq!(age(reported(110), domain, Some(100)), None);
+        assert_eq!(age(reported(10), domain, None), None);
+
+        let other = CaptureClockDomain::new(
+            core::num::NonZeroU64::new(2).expect("domain"),
+            core::num::NonZeroU64::new(10_000_000).expect("ticks"),
+        );
+        assert_eq!(age(reported(10), other, Some(100)), None);
+
+        assert!(publication_stale(101, None));
+        assert!(!publication_stale(100, None));
+        assert!(publication_stale(0, Some(CAPTURE_MAX_AGE_HNS + 1)));
+        assert!(!publication_stale(0, Some(CAPTURE_MAX_AGE_HNS)));
+    }
+
+    #[test]
+    fn saved_execution_rejects_ineligible_catalog_before_open() {
+        let profile = profile::RouteProfile::from_selection(
+            "source-fixed",
+            SourceKind::RenderLoopback,
+            None,
+            "output-fixed",
+            None,
+            profile::SavedPlayback::remote_defaults(),
+        )
+        .unwrap();
+        let format = profile::EndpointFormat {
+            sample_rate_hz: 48_000,
+            channels: 2,
+            bits_per_sample: 32,
+            valid_bits_per_sample: 32,
+            block_align: 8,
+            channel_mask: 3,
+            float32: true,
+        };
+        let source = CatalogEndpoint {
+            id: "source-fixed".into(),
+            label: "source".into(),
+            direction: CatalogDirection::Render,
+            state: CatalogState::Active,
+            format: Some(format),
+        };
+        let output = CatalogEndpoint {
+            id: "output-fixed".into(),
+            label: "output".into(),
+            ..source.clone()
+        };
+        let eligible = RouteCatalog::from_endpoints(vec![output.clone(), source.clone()]);
+        let (route, output_id) = checked_saved_route(&profile, &eligible).unwrap();
+        assert_eq!(route.id, "source-fixed");
+        assert_eq!(route.flow, CaptureFlow::Loopback);
+        assert_eq!(output_id, "output-fixed");
+
+        let incompatible_output = CatalogEndpoint {
+            format: Some(profile::EndpointFormat {
+                sample_rate_hz: 44_100,
+                ..format
+            }),
+            ..output.clone()
+        };
+        let unsupported = RouteCatalog::from_endpoints(vec![source.clone(), incompatible_output]);
+        assert!(checked_saved_route(&profile, &unsupported).is_err());
+        assert!(
+            profile
+                .preflight_report(&unsupported)
+                .contains("route_status=unsupported")
+        );
+
+        let wrong_kind = CatalogEndpoint {
+            direction: CatalogDirection::Capture,
+            ..source
+        };
+        let unsupported = RouteCatalog::from_endpoints(vec![wrong_kind, output]);
+        assert!(checked_saved_route(&profile, &unsupported).is_err());
+        assert!(checked_saved_route(&profile, &RouteCatalog::default()).is_err());
+    }
+
     #[test]
     fn unity_source_selection_preserves_bits_and_mix_is_explicit() {
         let own = [0.0, -0.0, f32::from_bits(1), 1.25];
@@ -763,5 +1153,41 @@ mod tests {
         assert_eq!(output[3], 0.0);
         mix(Playback::Mute, 1.0, 1.0, &own, &remote, &mut output).unwrap();
         assert_eq!(output, [0.0; 4]);
+    }
+
+    #[test]
+    fn projected_catalog_format_matches_the_open_path_native_check() {
+        let format = WasapiFormat {
+            sample_rate_hz: 48_000,
+            channels: 2,
+            bits_per_sample: 32,
+            valid_bits_per_sample: 32,
+            block_align: 8,
+            channel_mask: 3,
+            encoding: SampleEncoding::Float,
+        };
+        assert!(native_stereo(format));
+        assert!(profile::is_native_lab_format(&project_format(format)));
+
+        let mask = WasapiFormat {
+            channel_mask: 1,
+            ..format
+        };
+        assert!(!native_stereo(mask));
+        assert!(!profile::is_native_lab_format(&project_format(mask)));
+
+        let rate = WasapiFormat {
+            sample_rate_hz: 44_100,
+            ..format
+        };
+        assert!(!native_stereo(rate));
+        assert!(!profile::is_native_lab_format(&project_format(rate)));
+
+        let integer = WasapiFormat {
+            encoding: SampleEncoding::IntegerPcm,
+            ..format
+        };
+        assert!(!native_stereo(integer));
+        assert!(!profile::is_native_lab_format(&project_format(integer)));
     }
 }

@@ -15,19 +15,32 @@ mod format;
 mod mmcss;
 mod render;
 mod supervisor;
+mod wake;
 mod worker;
 
-pub use capture::{CaptureFlow, CaptureRequest, CaptureStreamDiagnostics, WasapiCaptureStream};
+pub use capture::{
+    CaptureFlow, CaptureRequest, CaptureStreamDiagnostics, NativeCapturePacket, NativeCaptureRead,
+    NativeCaptureRequest, WasapiCaptureStream,
+};
 pub use client::{EventWait, SharedEnginePeriods, SharedPeriodPreference, WasapiCallFailure};
-pub use clock::{WASAPI_QPC_TICKS_PER_SECOND, wasapi_clock_domain, wasapi_qpc_100ns_now};
+pub use clock::{
+    RenderClockFailure, RenderClockObservation, WASAPI_QPC_TICKS_PER_SECOND, wasapi_clock_domain,
+    wasapi_qpc_100ns_now,
+};
 pub use endpoint::{
     BindingAction, EndpointCatalog, EndpointEnumerator, EndpointInfo, EndpointRole,
     EndpointSelection, poll_binding, resolve_selection,
 };
 pub use error::WindowsAudioError;
-pub use format::{CapturePacketFlags, SampleEncoding, WasapiFormat};
+pub use format::{
+    CapturePacketFlags, NATIVE_F32_MAX_SAMPLE_RATE_HZ, NATIVE_F32_MIN_SAMPLE_RATE_HZ,
+    NativeF32Format, NativeFormatReject, NativePcmFormat, SampleEncoding, WasapiFormat,
+};
 pub use mmcss::MmcssRegistration;
-pub use render::{RenderRequest, RenderStreamDiagnostics, WasapiRenderStream};
+pub use render::{
+    NativeRenderReceipt, NativeRenderRequest, RenderRequest, RenderStreamDiagnostics,
+    WasapiRenderStream,
+};
 pub use rlb_audio::{
     MixGraphCommand, MixGraphConsumer, MixGraphPublishError, MixGraphPublisher, MixGraphReclaimer,
 };
@@ -35,6 +48,7 @@ pub use supervisor::{
     DeviceBindings, DeviceSupervisor, SlotStatus, SupervisorPoll, SupervisorShutdown,
     SupervisorSources,
 };
+pub use wake::{AudioWake, NativeWake};
 pub use worker::{
     CaptureWorker, CaptureWorkerReady, CaptureWorkerReport, RENDER_SOURCE_CAPACITY, RenderWorker,
     RenderWorkerReady, RenderWorkerReport,

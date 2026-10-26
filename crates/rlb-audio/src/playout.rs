@@ -453,7 +453,7 @@ impl DirectPcmPlayout {
 
     fn validate_shape(&self, samples: usize, nonempty: bool) -> Result<usize, PlayoutError> {
         let channels = usize::from(self.config.channels);
-        if samples % channels != 0 || (nonempty && samples == 0) {
+        if !samples.is_multiple_of(channels) || (nonempty && samples == 0) {
             return Err(PlayoutError::InvalidShape);
         }
         let frames = samples / channels;

@@ -195,6 +195,18 @@ impl SoftLimiter {
         let limited = self.knee + shoulder * (excess / (excess + shoulder));
         sample.signum() * limited.min(1.0)
     }
+
+    /// Same optional limiter at the render core's working precision.
+    #[must_use]
+    pub fn process_f64(self, sample: f64) -> f64 {
+        if !sample.is_finite() { return 0.0; }
+        let knee = f64::from(self.knee);
+        let magnitude = sample.abs();
+        if magnitude <= knee { return sample; }
+        let shoulder = 1.0 - knee;
+        let excess = magnitude - knee;
+        sample.signum() * (knee + shoulder * (excess / (excess + shoulder))).min(1.0)
+    }
 }
 
 impl Default for SoftLimiter {

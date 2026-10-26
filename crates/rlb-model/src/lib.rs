@@ -1,11 +1,14 @@
 #![forbid(unsafe_code)]
 
+
 //! Pure V2 domain values shared by control, registry, media, and audio crates.
 //!
 //! Identity types reject the reserved all-zero value and use a canonical
 //! 32-character lowercase hexadecimal representation. Domain constructors keep
 //! invalid floating-point values and inconsistent snapshots out of runtime
 //! state.
+
+pub mod pcm;
 
 mod error;
 mod id;

@@ -25,7 +25,7 @@ pub use backend::{
 pub use capture::{
     BoundedSpsc, CaptureBlock, CaptureBlockConsumer, CaptureBlockPool, CaptureBlockProducer,
     CaptureClockDomain, CaptureDiscontinuity, CaptureInput, CaptureMetadata, CaptureReblocker,
-    PlanarSamples, ReblockReport, TryPushError,
+    CaptureTiming, FrameTimeQuality, FrameTimestamp, PlanarSamples, ReblockReport, TryPushError,
 };
 pub use error::AudioError;
 pub use fake::{ConstantSourceReader, FakeCapture, FakeRender};
