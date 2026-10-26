@@ -59,6 +59,8 @@ Session-specific queued control replies preserve that route. A selected path's
 identity is confirmed before its IP-derived media policy is applied. Explicit
 interface/address restrictions wait when unavailable and never silently fall back.
 
+IP conditions match only the actual selected connection address. A matching advertised IPv4 address does not grant permission to a connection using that member's IPv6 address. The interface exposes the actual address and the deciding rule source.
+
 DNS-SD uses `_rlbroom._tcp.local.` with version/name/instance metadata and an
 optional address hint. Discovery and TCP directory availability recover
 independently. Discovered addresses never fill an omitted saved-card address.
