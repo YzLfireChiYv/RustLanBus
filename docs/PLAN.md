@@ -72,7 +72,7 @@ The source connects the agreed features through the shared controller. The 2026-
 
 ## Remaining closeout and evidence
 
-The current source connects settings migration, card editing, per-route state, demand-driven acquisition, resource retirement, smoothing and simultaneous IPv4/IPv6 paths. Commands, versions and multilingual usage documentation are aligned in the source. The OpenWrt integration covers its own native application package, module and management page through the existing authenticated gateway entry. Source changes alone do not alter a router process or shared network setting. See the [architecture](ARCHITECTURE.md) for component boundaries.
+The current source connects settings migration, card editing, per-route state, demand-driven acquisition, resource retirement, smoothing and simultaneous IPv4/IPv6 paths. Commands, versions and multilingual usage documentation are aligned in the source. The OpenWrt integration now uses the application's independent native package, GL Tools page and own CGI with the official administrator session; it does not revive the retired gateway controller. Ordinary updates preserve configuration and actual runtime/autostart intent without altering the proxy/network backend. [OpenWrt management](../services/openwrt-admin/README.md) records the local command boundary.
 
 The owner operates all actual tests. Do not launch applications, automate the interface, execute tests or probe real audio/network devices without a new explicit request. Necessary focused compilation and source inspection remain implementation aids. Report consequential feature or architecture choices before dependent implementation.
 

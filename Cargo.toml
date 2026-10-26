@@ -20,6 +20,7 @@ members = [
     "apps/desktop/src-tauri",
     "services/registryd",
     "services/contactd",
+    "services/openwrt-admin",
     "tools/udp-echo",
     "apps/short-path",
     "apps/peer-lab",

@@ -2849,6 +2849,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "rustlanbus-openwrt-admin"
+version = "0.2.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "rustlanbus-peer-lab"
 version = "0.2.0"
 dependencies = [

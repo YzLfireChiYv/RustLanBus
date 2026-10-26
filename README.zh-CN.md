@@ -2,7 +2,7 @@
 
 > 源码状态 — 2026-10-26：当前为开发候选。共享音频与控制实现已经存在；实际启动、界面、音频与网络验收分别记录。参见[架构说明](docs/ARCHITECTURE.md)与[产品计划](docs/PLAN.zh-CN.md)。
 
-<!-- Translation: zh-CN | Source: README.md | Source SHA256: 0a885eb519e38a43fd5d14ce76229ee293d8c661b7652dcc04c9aa8a438c3965 -->
+<!-- Translation: zh-CN | Source: README.md | Source SHA256: 6023b12878252d15c469aaad70ffb2145c70df8fafe2ae36bebd0564647cf445 -->
 
 [English](README.md) | 简体中文 | [繁體中文](README.zh-TW.md) | [日本語](README.ja.md)
 
@@ -29,6 +29,8 @@ Windows 是第一个平台。桌面与正式 CLI 共用一个 Rust 控制器。2
 原生整数 PCM16/24/32 与 F32/F64 在传输中保留各自声明的表示。工作缓冲区使用 F64。常见的单声道/立体声以及 5.1/7.1 布局带有面向扬声器的映射。不受支持的目标按音源/输出报告。没有接收需求、也没有本机监听时，原生采集会关闭，发布意图、P2P 联络与 keepalive 仍然保留。当前媒体协议：RLC5/RLP5；目录协议：JSON version2，在同一 UDP 端口上携带有界的地址备选。更早的开发中对等端需要一并更新。
 
 可选的登录启动默认为关。明确的 Windows 操作可以注册提升权限的登录任务，或允许本程序来自本地子网的入站 TCP/UDP 流量。这些操作不安装音频驱动，也不更改全局防火墙默认值。移动可执行文件后可能需要重新注册；界面显示实际注册状态，并提供修复与移除。
+
+在 GL SDK4 OpenWrt 目标上，RustLanBus 拥有独立的原生软件包与 Tools 页，并使用官方管理员会话。其 CGI 与短时管理命令在联络守护进程停止时仍可工作。普通应用维护无需遗留的网关控制器，也不改动代理/网络后端；参见[OpenWrt 管理](services/openwrt-admin/README.zh-CN.md)。
 
 ## 设置与恢复
 

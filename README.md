@@ -28,6 +28,8 @@ Native integer PCM16/24/32 and F32/F64 retain their declared representation in t
 
 Optional login startup defaults off. Explicit Windows actions can register an elevated login task or allow this program's inbound TCP/UDP traffic from the local subnet. They do not install audio drivers or change global firewall defaults. Moving the executable can require explicit re-registration; the interface shows the actual registration and offers repair/removal.
 
+On the GL SDK4 OpenWrt target, RustLanBus has an independent native package and Tools page using the official administrator session. Its CGI and short-lived management command work while the contact daemon is stopped. Ordinary application maintenance does not require the legacy gateway controller or alter the proxy/network backend; see [OpenWrt management](services/openwrt-admin/README.md).
+
 ## Settings and recovery
 
 Data stays in the Windows user directory. **Application and settings** shows the active configuration and GUI/core build identities, and supports opening another configuration, exporting a single readable JSON settings bundle, previewing an import and choosing its destination. Export includes the currently effective settings, including unsaved values, without changing the original files. It contains room passwords and should be kept with private backups.
